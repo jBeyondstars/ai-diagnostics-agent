@@ -266,9 +266,16 @@ public class UsersController(ILogger<UsersController> logger) : ControllerBase
             .Where(u => u.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
             .ToList();
 
-        // BUG: Assumes at least one result exists
-        var firstResult = results[0];
-        logger.LogInformation("First match: {Name}", firstResult.Name);
+        // Log first result only if results exist
+        if (results.Count > 0)
+        {
+            var firstResult = results[0];
+            logger.LogInformation("First match: {Name}", firstResult.Name);
+        }
+        else
+        {
+            logger.LogInformation("No users found matching query: {Query}", query);
+        }
 
         return Ok(results.Select(u => new UserDto
         {
