@@ -543,7 +543,7 @@ public sealed class DiagnosticsAgent(
 
                 if (newContent != currentContent)
                 {
-                    fileChanges.Add(new { path = filePath, content = newContent });
+                    fileChanges.Add(new { Path = filePath, Content = newContent });
                     logger.LogInformation("File {Path} will be included in PR", filePath);
                 }
                 else
@@ -572,7 +572,7 @@ public sealed class DiagnosticsAgent(
         descBuilder.AppendLine(report.Summary);
         descBuilder.AppendLine();
         descBuilder.AppendLine("## Changes");
-        foreach (var fix in fixes.Where(f => fileChanges.Any(fc => ((dynamic)fc).path == f.FilePath)))
+        foreach (var fix in fixes.Where(f => fileChanges.Any(fc => ((dynamic)fc).Path == f.FilePath)))
         {
             descBuilder.AppendLine($"- **{fix.FilePath}**: {fix.Explanation.Split('.')[0]}");
         }
@@ -589,25 +589,43 @@ public sealed class DiagnosticsAgent(
         try
         {
             var filesJson = JsonSerializer.Serialize(fileChanges);
+            logger.LogInformation("Creating PR with title: {Title}, {FileCount} file changes", title, fileChanges.Count);
+
             var result = await _gitHubPlugin.CreatePullRequestAsync(title, descBuilder.ToString(), filesJson);
+            logger.LogInformation("GitHub CreatePR response: {Response}", result?.Length > 500 ? result[..500] + "..." : result);
 
             try
             {
                 using var doc = JsonDocument.Parse(result);
                 if (doc.RootElement.TryGetProperty("html_url", out var urlProp))
-                    return urlProp.GetString();
+                {
+                    var url = urlProp.GetString();
+                    logger.LogInformation("PR created successfully: {Url}", url);
+                    return url;
+                }
+                if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                {
+                    logger.LogWarning("GitHub returned error: {Error}", errorProp.GetString());
+                }
             }
-            catch { }
+            catch (JsonException ex)
+            {
+                logger.LogWarning(ex, "Failed to parse GitHub response as JSON");
+            }
 
             var urlMatch = System.Text.RegularExpressions.Regex.Match(result, @"https://github\.com/[^\s""]+/pull/\d+");
             if (urlMatch.Success)
+            {
+                logger.LogInformation("Found PR URL via regex: {Url}", urlMatch.Value);
                 return urlMatch.Value;
+            }
 
+            logger.LogWarning("Could not extract PR URL from response");
             return result.Contains("error") ? null : result;
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Failed to create pull request");
+            logger.LogError(ex, "Failed to create pull request");
             return null;
         }
     }
