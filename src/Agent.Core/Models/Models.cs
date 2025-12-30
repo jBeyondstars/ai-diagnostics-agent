@@ -74,6 +74,11 @@ public sealed record AnalysisRequest
     public int MinOccurrences { get; init; } = 5;
     public int MaxExceptionsToAnalyze { get; init; } = 10;
 
+    /// <summary>
+    /// If true, only analyze the most recent exception (ignores MaxExceptionsToAnalyze)
+    /// </summary>
+    public bool LatestOnly { get; init; }
+
     public static AnalysisRequest Default => new();
 
     public static AnalysisRequest QuickScan => new()
@@ -89,6 +94,15 @@ public sealed record AnalysisRequest
         MinOccurrences = 5,
         MaxExceptionsToAnalyze = 20,
         CreateIssues = true
+    };
+
+    public static AnalysisRequest Latest => new()
+    {
+        HoursToAnalyze = 1,
+        MinOccurrences = 1,
+        MaxExceptionsToAnalyze = 1,
+        LatestOnly = true,
+        CreatePullRequest = true
     };
 }
 

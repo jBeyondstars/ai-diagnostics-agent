@@ -1,8 +1,8 @@
-using System.ComponentModel;
-using System.Text.Json;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Octokit;
+using System.ComponentModel;
+using System.Text.Json;
 
 namespace Agent.Plugins;
 
@@ -51,23 +51,36 @@ public sealed class GitHubPlugin(
             if (contents.Count > 0)
             {
                 var file = contents[0];
+                _logger.LogInformation("GitHub returned file: Path={Path}, Size={Size}, ContentLength={ContentLength}, EncodingType={Encoding}",
+                    file.Path, file.Size, file.Content?.Length ?? 0, file.Encoding);
 
                 if (!string.IsNullOrEmpty(file.Content))
                 {
-                    var decodedContent = System.Text.Encoding.UTF8.GetString(
-                        Convert.FromBase64String(file.Content));
-
-                    return JsonSerializer.Serialize(new
+                    try
                     {
-                        path = file.Path,
-                        sha = file.Sha,
-                        content = decodedContent,
-                        size = file.Size,
-                        encoding = "utf-8"
-                    }, JsonOptions);
+                        var decodedContent = System.Text.Encoding.UTF8.GetString(
+                            Convert.FromBase64String(file.Content));
+
+                        _logger.LogInformation("Successfully decoded Base64 content: {Length} chars", decodedContent.Length);
+                        return JsonSerializer.Serialize(new
+                        {
+                            path = file.Path,
+                            sha = file.Sha,
+                            content = decodedContent,
+                            size = file.Size,
+                            encoding = "utf-8"
+                        }, JsonOptions);
+                    }
+                    catch (FormatException ex)
+                    {
+                        _logger.LogWarning("Base64 decoding failed for {FilePath}: {Error}. Content preview: {Preview}",
+                            filePath, ex.Message, file.Content?[..Math.Min(100, file.Content?.Length ?? 0)]);
+                    }
                 }
 
+                _logger.LogInformation("Fetching raw content for {FilePath}", filePath);
                 var rawContent = await _client.Repository.Content.GetRawContentByRef(_owner, _repo, filePath, branch);
+                _logger.LogInformation("Got raw content: {Length} bytes", rawContent.Length);
 
                 return JsonSerializer.Serialize(new
                 {

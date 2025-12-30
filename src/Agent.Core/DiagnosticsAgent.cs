@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Agent.Core.Configuration;
 using Agent.Core.Models;
 using Agent.Core.Services;
@@ -10,6 +9,7 @@ using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.OpenAI;
+using System.Text.Json;
 
 namespace Agent.Core;
 
@@ -25,6 +25,9 @@ public sealed class DiagnosticsAgent(
     private readonly Kernel _kernel = CreateKernel(config.Value, logger);
     private ChatCompletionAgent? _agent;
     private bool _disposed;
+
+    private AppInsightsPlugin? _appInsightsPlugin;
+    private GitHubPlugin? _gitHubPlugin;
 
     private const string SystemPrompt = """
         You are an expert DevOps engineer and .NET developer. Your job is to analyze
@@ -115,25 +118,23 @@ public sealed class DiagnosticsAgent(
     {
         if (_agent is not null) return _agent;
 
-        // Register plugins
-        var appInsightsPlugin = new AppInsightsPlugin(
+        _appInsightsPlugin = new AppInsightsPlugin(
             _config.AppInsights.WorkspaceId,
             logger as ILogger<AppInsightsPlugin>);
-        _kernel.ImportPluginFromObject(appInsightsPlugin, "AppInsights");
+        _kernel.ImportPluginFromObject(_appInsightsPlugin, "AppInsights");
 
-        var gitHubPlugin = new GitHubPlugin(
+        _gitHubPlugin = new GitHubPlugin(
             _config.GitHub.Token,
             _config.GitHub.Owner,
             _config.GitHub.Repo,
             _config.GitHub.DefaultBranch,
             logger as ILogger<GitHubPlugin>);
-        _kernel.ImportPluginFromObject(gitHubPlugin, "GitHub");
+        _kernel.ImportPluginFromObject(_gitHubPlugin, "GitHub");
 
         logger.LogInformation("Registered plugins: AppInsights, GitHub ({Owner}/{Repo})",
             _config.GitHub.Owner, _config.GitHub.Repo);
 
-        // Create the agent using Semantic Kernel Agents Framework GA
-        #pragma warning disable SKEXP0110
+#pragma warning disable SKEXP0110
         _agent = new ChatCompletionAgent
         {
             Name = "DiagnosticsAgent",
@@ -146,165 +147,469 @@ public sealed class DiagnosticsAgent(
                 MaxTokens = 4096
             })
         };
-        #pragma warning restore SKEXP0110
+#pragma warning restore SKEXP0110
 
         return _agent;
     }
 
     /// <summary>
-    /// Runs a full analysis and optionally creates PRs/Issues
+    /// Runs a full analysis using 2-phase architecture:
+    /// Phase 1: Prefetch all data (exceptions + source files) in parallel
+    /// Phase 2: Single Claude call with complete context
     /// </summary>
     public async Task<DiagnosticReport> AnalyzeAndFixAsync(
         AnalysisRequest request,
         CancellationToken cancellationToken = default)
     {
         logger.LogInformation(
-            "Starting analysis: {Hours}h lookback, CreatePR={CreatePR}, MaxExceptions={Max}",
+            "Starting 2-phase analysis: {Hours}h lookback, CreatePR={CreatePR}, MaxExceptions={Max}",
             request.HoursToAnalyze,
             request.CreatePullRequest,
             request.MaxExceptionsToAnalyze);
 
-        var agent = GetOrCreateAgent();
+        GetOrCreateAgent();
 
-        #pragma warning disable SKEXP0110
-        var chatHistory = new ChatHistory();
-        #pragma warning restore SKEXP0110
+        // PHASE 1: Prefetch all data in parallel (no Claude calls)
+        logger.LogInformation("Phase 1: Prefetching data from AppInsights and GitHub...");
 
-        var userPrompt = $$"""
-            Analyze the exceptions from the last {{request.HoursToAnalyze}} hours.
+        // 1a. Get exceptions from AppInsights
+        string exceptionsJson;
+        if (request.LatestOnly)
+        {
+            logger.LogInformation("LatestOnly mode: fetching only the most recent exception");
+            exceptionsJson = await _appInsightsPlugin!.GetLatestExceptionAsync(request.HoursToAnalyze);
+        }
+        else
+        {
+            exceptionsJson = await _appInsightsPlugin!.GetExceptionsAsync(
+                request.HoursToAnalyze,
+                request.MinOccurrences,
+                request.MaxExceptionsToAnalyze);
+        }
 
-            Requirements:
-            - Minimum {{request.MinOccurrences}} occurrences to consider
-            - Analyze up to {{request.MaxExceptionsToAnalyze}} most critical exceptions
-            - For each critical exception, retrieve and analyze the source code
-            - Propose concrete fixes with before/after code
+        var exceptions = ParseExceptionsFromJson(exceptionsJson);
+        logger.LogInformation("Found {Count} exceptions to analyze", exceptions.Count);
 
-            After analysis, respond with a JSON report in this exact format:
+        if (exceptions.Count == 0)
+        {
+            return new DiagnosticReport
+            {
+                GeneratedAt = DateTimeOffset.UtcNow,
+                AnalysisPeriod = TimeSpan.FromHours(request.HoursToAnalyze),
+                Summary = "No exceptions found matching the criteria.",
+                Exceptions = [],
+                ProposedFixes = []
+            };
+        }
+
+        // 1b. Extract source file paths from stack traces
+        var sourceFiles = exceptions
+            .Where(e => !string.IsNullOrEmpty(e.SourceFile))
+            .Select(e => e.SourceFile!)
+            .Distinct()
+            .Take(10)
+            .ToList();
+
+        logger.LogInformation("Identified {Count} source files to fetch", sourceFiles.Count);
+
+        // 1c. Fetch all source files in parallel
+        var fileContents = new Dictionary<string, string>();
+        if (sourceFiles.Count > 0)
+        {
+            var fileTasks = sourceFiles.Select(async file =>
+            {
+                try
+                {
+                    var json = await _gitHubPlugin!.GetFileContentAsync(file);
+
+                    using var doc = JsonDocument.Parse(json);
+                    if (doc.RootElement.TryGetProperty("content", out var contentProp))
+                    {
+                        var content = contentProp.GetString() ?? "";
+                        logger.LogDebug("Fetched {File}: {Length} chars", file, content.Length);
+                        return (file, content);
+                    }
+                    if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                    {
+                        var error = errorProp.GetString() ?? "Unknown error";
+                        logger.LogWarning("GitHub returned error for {File}: {Error}", file, error);
+                        return (file, $"Error: {error}");
+                    }
+                    return (file, "Error: Invalid response format from GitHub");
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Failed to fetch file: {File}", file);
+                    return (file, $"Error: {ex.Message}");
+                }
+            });
+
+            var results = await Task.WhenAll(fileTasks);
+            foreach (var (file, content) in results)
+            {
+                fileContents[file] = content.Length > 15000
+                    ? content[..15000] + "\n... (truncated)"
+                    : content;
+
+                var preview = content.Length > 200 ? content[..200] : content;
+                var isError = content.StartsWith("Error:");
+                logger.LogInformation("File {File}: {Length} chars, isError={IsError}, preview: {Preview}",
+                    file, content.Length, isError, preview.Replace("\n", "\\n"));
+            }
+        }
+
+        logger.LogInformation("Phase 1 complete. Fetched {FileCount} files.", fileContents.Count);
+
+        // PHASE 2: Single call with all context
+        logger.LogInformation("Phase 2: Analyzing with Claude (single call)...");
+
+        var contextBuilder = new System.Text.StringBuilder();
+        contextBuilder.AppendLine("# Exception Analysis Context");
+        contextBuilder.AppendLine();
+        contextBuilder.AppendLine("## Exceptions from Application Insights");
+        contextBuilder.AppendLine("```json");
+        contextBuilder.AppendLine(exceptionsJson);
+        contextBuilder.AppendLine("```");
+        contextBuilder.AppendLine();
+
+        if (fileContents.Count > 0)
+        {
+            contextBuilder.AppendLine("## Source Code Files (with line numbers)");
+            foreach (var (file, content) in fileContents)
+            {
+                contextBuilder.AppendLine($"### {file}");
+                contextBuilder.AppendLine("```csharp");
+                var lines = content.Split('\n');
+                logger.LogInformation("Adding {LineCount} lines from {File} to context", lines.Length, file);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    contextBuilder.AppendLine($"{i + 1,4}: {lines[i]}");
+                }
+                contextBuilder.AppendLine("```");
+                contextBuilder.AppendLine();
+            }
+            logger.LogInformation("Total context size: {Size} chars", contextBuilder.Length);
+        }
+
+        var prompt = $$"""
+            You are an expert .NET developer. Analyze these production exceptions and propose fixes.
+
+            {{contextBuilder}}
+
+            ## Your Task
+            1. Look at the exception type and method name in the stack trace
+            2. Find that method in the source code above (lines are numbered: "  123: code")
+            3. Identify the buggy line(s) that cause the exception
+            4. Propose a fix
+
+            ## CRITICAL: How to specify originalCode
+            The source code has line numbers. To specify originalCode:
+            1. Find the buggy line (e.g., line 270)
+            2. Copy the EXACT code after the line number, preserving ALL whitespace
+            3. Include 1-3 surrounding lines for context
+
+            Example - if you see:
+            ```
+             269:         var results = _users.Values.Where(...).ToList();
+             270:         var firstResult = results[0];
+             271:         logger.LogInformation("First match: {Name}", firstResult.Name);
+            ```
+            Then originalCode should be:
+            "        var firstResult = results[0];\n        logger.LogInformation(\"First match: {Name}\", firstResult.Name);"
+
+            DO NOT write comments like "// Line 270..." - copy the ACTUAL code!
+
+            Respond with JSON:
             ```json
             {
-                "summary": "Brief executive summary",
-                "exceptionsAnalyzed": 5,
-                "fixesProposed": 3,
-                "exceptions": [
-                    {
-                        "type": "System.NullReferenceException",
-                        "occurrences": 150,
-                        "severity": "Critical",
-                        "rootCause": "Description of root cause"
-                    }
-                ],
-                "fixes": [
-                    {
-                        "filePath": "src/Services/OrderService.cs",
-                        "originalCode": "var name = customer.Name;",
-                        "fixedCode": "var name = customer?.Name ?? string.Empty;",
-                        "explanation": "Added null-conditional operator to prevent NRE",
-                        "severity": "Critical",
-                        "confidence": "High"
-                    }
-                ]
+                "summary": "Brief summary",
+                "exceptions": [{"type": "...", "occurrences": 1, "severity": "High", "rootCause": "..."}],
+                "fixes": [{"filePath": "...", "originalCode": "ACTUAL code copied from above", "fixedCode": "fixed version", "explanation": "...", "severity": "High", "confidence": "High"}]
             }
             ```
-
-            Start by calling get_exceptions to discover what's happening.
             """;
 
-        chatHistory.AddUserMessage(userPrompt);
+        var chatService = _kernel.GetRequiredService<IChatCompletionService>();
+        var chatHistory = new ChatHistory();
+        chatHistory.AddUserMessage(prompt);
 
-        logger.LogInformation("Agent starting analysis...");
+        // Phase 2: NO TOOLS - Claude analyzes prefetched context only (single call)
+        var response = await chatService.GetChatMessageContentsAsync(
+            chatHistory,
+            kernel: null,
+            cancellationToken: cancellationToken);
 
-        // Invoke the agent
-        #pragma warning disable SKEXP0110
-        var responses = new List<string>();
-        await foreach (var response in agent.InvokeAsync(chatHistory, cancellationToken: cancellationToken))
-        {
-            var content = response.Message?.Content ?? response.ToString();
-            responses.Add(content ?? "");
-            logger.LogDebug("Agent response chunk received");
-        }
-        #pragma warning restore SKEXP0110
-
-        var fullResponse = string.Join("", responses);
-        logger.LogDebug("Agent response: {Response}", fullResponse);
+        var fullResponse = string.Join("", response.Select(r => r.Content));
+        logger.LogDebug("Claude response: {Response}", fullResponse);
 
         var report = ParseReport(fullResponse);
 
-        // Step 2: Create PR if requested and we have fixes
-        if (request.CreatePullRequest && report.ProposedFixes.Count > 0)
+        report = report with
         {
-            logger.LogInformation("Creating Pull Request with {Count} fixes", report.ProposedFixes.Count);
-
-            chatHistory.AddAssistantMessage(fullResponse);
-            chatHistory.AddUserMessage("""
-                Great analysis! Now create a Pull Request with the fixes you proposed.
-
-                Use the create_pull_request function with:
-                - A clear, descriptive title
-                - A detailed description explaining each fix
-                - The file changes in JSON format
-
-                Make sure the PR description includes:
-                1. Summary of exceptions fixed
-                2. Root cause analysis
-                3. How the fixes address each issue
-                """);
-
-            #pragma warning disable SKEXP0110
-            var prResponses = new List<string>();
-            await foreach (var response in agent.InvokeAsync(chatHistory, cancellationToken: cancellationToken))
-            {
-                var content = response.Message?.Content ?? response.ToString();
-                prResponses.Add(content ?? "");
-            }
-            #pragma warning restore SKEXP0110
-
-            var prUrl = ExtractUrl(string.Join("", prResponses), "github.com");
-            if (prUrl is not null)
-            {
-                report = report with { PullRequestUrl = prUrl };
-                logger.LogInformation("Created PR: {Url}", prUrl);
-            }
-        }
-
-        // Step 3: Create Issues for problems we couldn't fix
-        if (request.CreateIssues)
-        {
-            var unfixedExceptions = report.Exceptions
-                .Where(e => !report.ProposedFixes.Any(f => f.RelatedExceptions.Contains(e.ExceptionType)))
-                .Where(e => e.Severity is "Critical" or "High")
-                .ToList();
-
-            if (unfixedExceptions.Count > 0)
-            {
-                logger.LogInformation("Creating Issues for {Count} unfixed exceptions", unfixedExceptions.Count);
-
-                chatHistory.AddUserMessage($$"""
-                    Some critical exceptions couldn't be automatically fixed.
-                    Create GitHub Issues for these {{unfixedExceptions.Count}} exceptions
-                    so the team can investigate manually.
-
-                    Include in each issue:
-                    - Exception details and frequency
-                    - Stack trace summary
-                    - Your analysis of potential causes
-                    - Suggested investigation steps
-                    """);
-
-                #pragma warning disable SKEXP0110
-                await foreach (var _ in agent.InvokeAsync(chatHistory, cancellationToken: cancellationToken))
-                {
-                    // Process issue creation responses
-                }
-                #pragma warning restore SKEXP0110
-            }
-        }
+            Exceptions = exceptions,
+            AnalysisPeriod = TimeSpan.FromHours(request.HoursToAnalyze)
+        };
 
         logger.LogInformation(
             "Analysis complete: {Exceptions} exceptions, {Fixes} fixes proposed",
             report.Exceptions.Count,
             report.ProposedFixes.Count);
 
+        // PHASE 3: Create PR if requested and fixes are available
+        if (request.CreatePullRequest && report.ProposedFixes.Count > 0)
+        {
+            logger.LogInformation("Phase 3: Creating Pull Request...");
+            try
+            {
+                var prUrl = await CreatePullRequestAsync(report, cancellationToken);
+                if (!string.IsNullOrEmpty(prUrl))
+                {
+                    report = report with { PullRequestUrl = prUrl };
+                    logger.LogInformation("PR created: {Url}", prUrl);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to create PR");
+            }
+        }
+
         return report;
+    }
+
+    /// <summary>
+    /// Parses exceptions from the AppInsights JSON response
+    /// </summary>
+    private List<ExceptionInfo> ParseExceptionsFromJson(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+
+            if (doc.RootElement.ValueKind == JsonValueKind.Object)
+            {
+                if (doc.RootElement.TryGetProperty("error", out _))
+                {
+                    logger.LogWarning("AppInsights returned error: {Json}", json);
+                }
+                return [];
+            }
+
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                logger.LogWarning("Unexpected JSON format (expected array): {Kind}", doc.RootElement.ValueKind);
+                return [];
+            }
+
+            var exceptions = new List<ExceptionInfo>();
+
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                exceptions.Add(new ExceptionInfo
+                {
+                    ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
+                    Message = item.TryGetProperty("Message", out var msg) ? msg.GetString() ?? "" : "",
+                    StackTrace = item.TryGetProperty("StackTrace", out var st) ? st.GetString() ?? "" : "",
+                    OperationName = item.TryGetProperty("OperationName", out var op) ? op.GetString() ?? "" : "",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
+                    ProblemId = item.TryGetProperty("ProblemId", out var pid) ? pid.GetString() : null,
+                    SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
+                    LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number
+                        ? ln.GetInt32() : null
+                });
+            }
+
+            return exceptions;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to parse exceptions JSON");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Creates a GitHub Pull Request with the proposed fixes
+    /// </summary>
+    private async Task<string?> CreatePullRequestAsync(DiagnosticReport report, CancellationToken cancellationToken)
+    {
+        if (_gitHubPlugin is null || report.ProposedFixes.Count == 0)
+            return null;
+
+        var fixes = report.ProposedFixes;
+        var exceptions = report.Exceptions;
+
+        var fileChanges = new List<object>();
+        var fixesByFile = fixes.GroupBy(f => f.FilePath);
+
+        foreach (var fileGroup in fixesByFile)
+        {
+            var filePath = fileGroup.Key;
+            if (string.IsNullOrEmpty(filePath)) continue;
+
+            logger.LogInformation("Processing fixes for file: {Path}", filePath);
+
+            try
+            {
+                var json = await _gitHubPlugin.GetFileContentAsync(filePath);
+
+                string currentContent;
+                using (var doc = JsonDocument.Parse(json))
+                {
+                    if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                    {
+                        logger.LogWarning("Could not fetch file for PR: {Path}, Error: {Error}",
+                            filePath, errorProp.GetString());
+                        continue;
+                    }
+                    if (!doc.RootElement.TryGetProperty("content", out var contentProp))
+                    {
+                        logger.LogWarning("Invalid GitHub response for {Path}: no content property", filePath);
+                        continue;
+                    }
+                    currentContent = contentProp.GetString() ?? "";
+                }
+
+                logger.LogInformation("Fetched {Path}: {Length} chars for PR", filePath, currentContent.Length);
+
+                var newContent = currentContent;
+                var lines = currentContent.Split('\n').ToList();
+
+                foreach (var fix in fileGroup)
+                {
+                    logger.LogInformation("Attempting fix - OriginalCode ({OLen} chars): {Original}",
+                        fix.OriginalCode?.Length ?? 0,
+                        fix.OriginalCode?.Length > 100 ? fix.OriginalCode[..100] + "..." : fix.OriginalCode);
+
+                    var isPlaceholder = fix.OriginalCode?.Contains("// Unable") == true ||
+                        fix.OriginalCode?.Contains("// Line") == true ||
+                        fix.OriginalCode?.Contains("// The") == true ||
+                        fix.OriginalCode?.Contains("Line 270") == true ||
+                        fix.OriginalCode?.Contains("not visible") == true ||
+                        fix.OriginalCode?.Contains("Unable to") == true ||
+                        fix.OriginalCode?.Contains("only contains") == true ||
+                        fix.OriginalCode?.Contains("Note:") == true ||
+                        fix.OriginalCode?.Contains("mismatch") == true ||
+                        fix.OriginalCode?.StartsWith("//") == true ||
+                        fix.OriginalCode?.StartsWith("Note") == true;
+
+                    if (isPlaceholder)
+                    {
+                        var matchingException = report.Exceptions.FirstOrDefault(e =>
+                            e.SourceFile == filePath || filePath.EndsWith(e.SourceFile ?? ""));
+
+                        if (matchingException?.LineNumber is int lineNum && lineNum > 0 && lineNum <= lines.Count)
+                        {
+                            logger.LogInformation("Using fallback: applying fix at line {LineNum}", lineNum);
+
+                            var buggyLine = lines[lineNum - 1]; // 0-indexed
+                            logger.LogInformation("Buggy line content: {Line}", buggyLine.Trim());
+
+                            var indexMatch = System.Text.RegularExpressions.Regex.Match(buggyLine, @"(\w+)\s*\[");
+                            if (indexMatch.Success)
+                            {
+                                var varName = indexMatch.Groups[1].Value;
+                                var indent = new string(' ', buggyLine.TakeWhile(char.IsWhiteSpace).Count());
+
+                                var checkLine = $"{indent}if ({varName}.Count == 0) {{ logger.LogWarning(\"No items in {varName}\"); return Ok(new {{ message = \"No results found\" }}); }}";
+
+                                lines.Insert(lineNum - 1, checkLine);
+                                newContent = string.Join('\n', lines);
+                                logger.LogInformation("Applied fallback fix: added bounds check for '{VarName}' at line {LineNum}", varName, lineNum);
+                            }
+                            else
+                            {
+                                logger.LogWarning("Could not identify index access pattern in line {LineNum}", lineNum);
+                            }
+                        }
+                        continue;
+                    }
+
+                    if (!string.IsNullOrEmpty(fix.OriginalCode) && !string.IsNullOrEmpty(fix.FixedCode))
+                    {
+                        if (newContent.Contains(fix.OriginalCode))
+                        {
+                            newContent = newContent.Replace(fix.OriginalCode, fix.FixedCode);
+                            logger.LogInformation("Successfully applied fix for {Path}", filePath);
+                        }
+                        else
+                        {
+                            logger.LogWarning("Could not find original code in {Path}. Looking for: {Code}",
+                                filePath, fix.OriginalCode?.Length > 50 ? fix.OriginalCode[..50] + "..." : fix.OriginalCode);
+                        }
+                    }
+                }
+
+                if (newContent != currentContent)
+                {
+                    fileChanges.Add(new { path = filePath, content = newContent });
+                    logger.LogInformation("File {Path} will be included in PR", filePath);
+                }
+                else
+                {
+                    logger.LogWarning("No changes applied to {Path} - content unchanged", filePath);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to process file for PR: {Path}", filePath);
+            }
+        }
+
+        if (fileChanges.Count == 0)
+        {
+            logger.LogWarning("No file changes to include in PR");
+            return null;
+        }
+
+        var title = exceptions.Count == 1
+            ? $"fix: Handle {exceptions[0].ExceptionType.Split('.').Last()}"
+            : $"fix: Address {exceptions.Count} production exceptions";
+
+        var descBuilder = new System.Text.StringBuilder();
+        descBuilder.AppendLine("## Summary");
+        descBuilder.AppendLine(report.Summary);
+        descBuilder.AppendLine();
+        descBuilder.AppendLine("## Changes");
+        foreach (var fix in fixes.Where(f => fileChanges.Any(fc => ((dynamic)fc).path == f.FilePath)))
+        {
+            descBuilder.AppendLine($"- **{fix.FilePath}**: {fix.Explanation.Split('.')[0]}");
+        }
+        descBuilder.AppendLine();
+        descBuilder.AppendLine("## Exceptions Fixed");
+        foreach (var ex in exceptions.Take(5))
+        {
+            descBuilder.AppendLine($"- `{ex.ExceptionType}` ({ex.OccurrenceCount} occurrences)");
+        }
+        descBuilder.AppendLine();
+        descBuilder.AppendLine("---");
+        descBuilder.AppendLine("*Generated by AI Diagnostics Agent*");
+
+        try
+        {
+            var filesJson = JsonSerializer.Serialize(fileChanges);
+            var result = await _gitHubPlugin.CreatePullRequestAsync(title, descBuilder.ToString(), filesJson);
+
+            try
+            {
+                using var doc = JsonDocument.Parse(result);
+                if (doc.RootElement.TryGetProperty("html_url", out var urlProp))
+                    return urlProp.GetString();
+            }
+            catch { }
+
+            var urlMatch = System.Text.RegularExpressions.Regex.Match(result, @"https://github\.com/[^\s""]+/pull/\d+");
+            if (urlMatch.Success)
+                return urlMatch.Value;
+
+            return result.Contains("error") ? null : result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to create pull request");
+            return null;
+        }
     }
 
     /// <summary>
@@ -317,9 +622,9 @@ public sealed class DiagnosticsAgent(
     {
         var agent = GetOrCreateAgent();
 
-        #pragma warning disable SKEXP0110
+#pragma warning disable SKEXP0110
         var chatHistory = new ChatHistory();
-        #pragma warning restore SKEXP0110
+#pragma warning restore SKEXP0110
 
         chatHistory.AddUserMessage($$"""
             Analyze exceptions from the last {{request.HoursToAnalyze}} hours.
@@ -327,7 +632,7 @@ public sealed class DiagnosticsAgent(
             Explain your reasoning step by step as you work.
             """);
 
-        #pragma warning disable SKEXP0110
+#pragma warning disable SKEXP0110
         await foreach (var response in agent.InvokeStreamingAsync(chatHistory, cancellationToken: cancellationToken))
         {
             var content = response.Message?.Content ?? response.ToString();
@@ -336,7 +641,7 @@ public sealed class DiagnosticsAgent(
                 yield return content;
             }
         }
-        #pragma warning restore SKEXP0110
+#pragma warning restore SKEXP0110
     }
 
     /// <summary>
@@ -350,9 +655,9 @@ public sealed class DiagnosticsAgent(
 
         var agent = GetOrCreateAgent();
 
-        #pragma warning disable SKEXP0110
+#pragma warning disable SKEXP0110
         var chatHistory = new ChatHistory();
-        #pragma warning restore SKEXP0110
+#pragma warning restore SKEXP0110
 
         chatHistory.AddUserMessage($$"""
             Analyze this specific exception and propose a fix:
@@ -386,14 +691,14 @@ public sealed class DiagnosticsAgent(
             ```
             """);
 
-        #pragma warning disable SKEXP0110
+#pragma warning disable SKEXP0110
         var responses = new List<string>();
         await foreach (var response in agent.InvokeAsync(chatHistory, cancellationToken: cancellationToken))
         {
             var content = response.Message?.Content ?? response.ToString();
             responses.Add(content ?? "");
         }
-        #pragma warning restore SKEXP0110
+#pragma warning restore SKEXP0110
 
         return ParseCodeFix(string.Join("", responses), exception);
     }
@@ -413,6 +718,7 @@ public sealed class DiagnosticsAgent(
                 GeneratedAt = DateTimeOffset.UtcNow,
                 AnalysisPeriod = TimeSpan.FromHours(24),
                 Summary = parsed?.Summary ?? "Analysis completed",
+                PullRequestUrl = parsed?.PullRequestUrl,
                 Exceptions = parsed?.Exceptions?.Select(e => new ExceptionInfo
                 {
                     ExceptionType = e.Type ?? "Unknown",
@@ -519,6 +825,7 @@ public sealed class DiagnosticsAgent(
 
     private sealed record ReportDto(
         string? Summary,
+        string? PullRequestUrl,
         int? ExceptionsAnalyzed,
         int? FixesProposed,
         List<ExceptionDto>? Exceptions,

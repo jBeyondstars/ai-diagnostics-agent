@@ -1,6 +1,10 @@
 using Agent.Core;
+using Agent.Core.Configuration;
 using Agent.Core.Models;
+using Azure.Identity;
+using Azure.Monitor.Query;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace Agent.Api.Controllers;
 
@@ -13,8 +17,10 @@ namespace Agent.Api.Controllers;
 [Produces("application/json")]
 public class DiagnosticsController(
     DiagnosticsAgent agent,
+    IOptions<AgentConfiguration> config,
     ILogger<DiagnosticsController> logger) : ControllerBase
 {
+    private readonly AgentConfiguration _config = config.Value;
     /// <summary>
     /// Run a full exception analysis from Application Insights.
     /// </summary>
@@ -54,6 +60,21 @@ public class DiagnosticsController(
         logger.LogInformation("Starting quick scan");
 
         var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.QuickScan, cancellationToken);
+
+        return Ok(report);
+    }
+
+    /// <summary>
+    /// Analyze only the most recent exception and create a PR.
+    /// </summary>
+    [HttpPost("analyze-latest")]
+    [ProducesResponseType<DiagnosticReport>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
+    public async Task<ActionResult<DiagnosticReport>> AnalyzeLatest(CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Analyzing latest exception only");
+
+        var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.Latest, cancellationToken);
 
         return Ok(report);
     }
@@ -102,6 +123,63 @@ public class DiagnosticsController(
             SampleResponse = string.Join("", chunks)
         });
     }
+
+    /// <summary>
+    /// Test Application Insights connectivity and list available tables.
+    /// </summary>
+    [HttpGet("test-appinsights")]
+    [ProducesResponseType<AppInsightsTestResult>(StatusCodes.Status200OK)]
+    public async Task<ActionResult<AppInsightsTestResult>> TestAppInsights(CancellationToken cancellationToken)
+    {
+        var workspaceId = _config.AppInsights.WorkspaceId;
+        logger.LogInformation("Testing App Insights connection. WorkspaceId: {WorkspaceId}", workspaceId);
+
+        if (string.IsNullOrEmpty(workspaceId))
+        {
+            return Ok(new AppInsightsTestResult
+            {
+                Success = false,
+                WorkspaceId = "(not configured)",
+                Message = "WorkspaceId is not configured",
+                Error = "Set Agent:AppInsights:WorkspaceId in user secrets or configuration"
+            });
+        }
+
+        try
+        {
+            var client = new LogsQueryClient(new DefaultAzureCredential());
+
+            var response = await client.QueryWorkspaceAsync(
+                workspaceId,
+                "search * | distinct $table | take 20",
+                new QueryTimeRange(TimeSpan.FromHours(24)),
+                cancellationToken: cancellationToken);
+
+            var tables = response.Value.Table.Rows
+                .Select(r => r[0]?.ToString() ?? "")
+                .Where(t => !string.IsNullOrEmpty(t))
+                .ToList();
+
+            return Ok(new AppInsightsTestResult
+            {
+                Success = true,
+                WorkspaceId = workspaceId,
+                Message = $"Connected successfully. Found {tables.Count} tables with data.",
+                AvailableTables = tables
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Failed to connect to App Insights");
+            return Ok(new AppInsightsTestResult
+            {
+                Success = false,
+                WorkspaceId = workspaceId,
+                Message = "Failed to connect to Application Insights",
+                Error = ex.Message
+            });
+        }
+    }
 }
 
 public record AgentStatus
@@ -118,4 +196,13 @@ public record LlmTestResult
     public bool Success { get; init; }
     public required string Message { get; init; }
     public string? SampleResponse { get; init; }
+}
+
+public record AppInsightsTestResult
+{
+    public bool Success { get; init; }
+    public required string WorkspaceId { get; init; }
+    public required string Message { get; init; }
+    public string? Error { get; init; }
+    public List<string>? AvailableTables { get; init; }
 }

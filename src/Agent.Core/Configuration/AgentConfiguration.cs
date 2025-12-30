@@ -41,7 +41,7 @@ public sealed class AnthropicConfiguration
     /// <summary>
     /// Model to use.
     /// </summary>
-    public string Model { get; set; } = "claude-opus-4-5-20251101";
+    public string Model { get; set; } = "claude-sonnet-4-5-20250929";
 }
 
 public sealed class OpenAIConfiguration

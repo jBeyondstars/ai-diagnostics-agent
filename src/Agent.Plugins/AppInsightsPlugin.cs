@@ -1,12 +1,11 @@
+using Azure.Identity;
+using Azure.Monitor.Query;
+using Microsoft.Extensions.Logging;
+using Microsoft.SemanticKernel;
 using System.Collections.Frozen;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using Azure.Identity;
-using Azure.Monitor.Query;
-using Azure.Monitor.Query.Models;
-using Microsoft.Extensions.Logging;
-using Microsoft.SemanticKernel;
 
 namespace Agent.Plugins;
 
@@ -32,6 +31,69 @@ public sealed partial class AppInsightsPlugin(
     }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Gets the most recent exception from Application Insights
+    /// </summary>
+    public async Task<string> GetLatestExceptionAsync(int hours = 1)
+    {
+        _logger.LogInformation("Querying latest exception from the last {Hours} hours", hours);
+
+        var query = $"""
+            AppExceptions
+            | where TimeGenerated > ago({hours}h)
+            | order by TimeGenerated desc
+            | take 1
+            | project
+                ExceptionType,
+                ProblemId,
+                OccurrenceCount = 1,
+                AffectedUsers = 1,
+                FirstSeen = TimeGenerated,
+                LastSeen = TimeGenerated,
+                Message = OuterMessage,
+                StackTrace = Details,
+                OperationName
+            """;
+
+        try
+        {
+            var response = await _logsClient.QueryWorkspaceAsync(
+                _workspaceId,
+                query,
+                new QueryTimeRange(TimeSpan.FromHours(hours)));
+
+            var results = response.Value.Table.Rows.Select(row =>
+            {
+                var stackTrace = row["StackTrace"]?.ToString() ?? "";
+                var (sourceFile, lineNumber) = ParseStackTrace(stackTrace);
+
+                return new
+                {
+                    ExceptionType = row["ExceptionType"]?.ToString(),
+                    ProblemId = row["ProblemId"]?.ToString(),
+                    OccurrenceCount = 1,
+                    AffectedUsers = 1,
+                    FirstSeen = row["FirstSeen"]?.ToString(),
+                    LastSeen = row["LastSeen"]?.ToString(),
+                    Message = row["Message"]?.ToString(),
+                    StackTrace = TruncateStackTrace(stackTrace, 2000),
+                    OperationName = row["OperationName"]?.ToString(),
+                    SourceFile = sourceFile,
+                    LineNumber = lineNumber
+                };
+            }).ToList();
+
+            _logger.LogInformation("Found {Count} exception(s)", results.Count);
+
+            return JsonSerializer.Serialize(results, JsonOptions);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error querying latest exception");
+            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+        }
+    }
+
+    /// <summary>
     /// Gets aggregated exceptions from Application Insights
     /// </summary>
     [KernelFunction("get_exceptions")]
@@ -47,23 +109,23 @@ public sealed partial class AppInsightsPlugin(
         _logger.LogInformation("Querying exceptions for the last {Hours} hours", hours);
 
         var query = $"""
-            exceptions
-            | where timestamp > ago({hours}h)
+            AppExceptions
+            | where TimeGenerated > ago({hours}h)
             | summarize
                 OccurrenceCount = count(),
-                AffectedUsers = dcount(user_Id),
-                FirstSeen = min(timestamp),
-                LastSeen = max(timestamp),
-                SampleMessage = take_any(outerMessage),
-                SampleStackTrace = take_any(details[0].rawStack),
-                SampleOperation = take_any(operation_Name)
-              by type, problemId
+                AffectedUsers = dcount(UserId),
+                FirstSeen = min(TimeGenerated),
+                LastSeen = max(TimeGenerated),
+                SampleMessage = take_any(OuterMessage),
+                SampleStackTrace = take_any(Details),
+                SampleOperation = take_any(OperationName)
+              by ExceptionType, ProblemId
             | where OccurrenceCount >= {minOccurrences}
             | order by OccurrenceCount desc
             | take {maxResults}
             | project
-                ExceptionType = type,
-                ProblemId = problemId,
+                ExceptionType,
+                ProblemId,
                 OccurrenceCount,
                 AffectedUsers,
                 FirstSeen,
@@ -107,8 +169,13 @@ public sealed partial class AppInsightsPlugin(
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error querying Application Insights");
-            return JsonSerializer.Serialize(new { error = ex.Message }, JsonOptions);
+            _logger.LogError(ex, "Error querying Application Insights. WorkspaceId: {WorkspaceId}", _workspaceId);
+            return JsonSerializer.Serialize(new
+            {
+                error = ex.Message,
+                workspaceId = _workspaceId,
+                innerError = ex.InnerException?.Message
+            }, JsonOptions);
         }
     }
 
@@ -128,21 +195,21 @@ public sealed partial class AppInsightsPlugin(
         _logger.LogInformation("Getting details for {ExceptionType}", exceptionType);
 
         var query = $"""
-            exceptions
-            | where timestamp > ago({hours}h)
-            | where type == "{EscapeKql(exceptionType)}"
-            | order by timestamp desc
+            AppExceptions
+            | where TimeGenerated > ago({hours}h)
+            | where ExceptionType == "{EscapeKql(exceptionType)}"
+            | order by TimeGenerated desc
             | take {sampleCount}
             | project
-                Timestamp = timestamp,
-                OperationId = operation_Id,
-                OperationName = operation_Name,
-                Message = outerMessage,
-                InnerMessage = innermostMessage,
-                StackTrace = details[0].rawStack,
-                CustomDimensions = customDimensions,
-                UserId = user_Id,
-                SessionId = session_Id
+                Timestamp = TimeGenerated,
+                OperationId,
+                OperationName,
+                Message = OuterMessage,
+                InnerMessage = InnermostMessage,
+                StackTrace = Details,
+                Properties,
+                UserId,
+                SessionId
             """;
 
         try
@@ -186,16 +253,16 @@ public sealed partial class AppInsightsPlugin(
         _logger.LogInformation("Querying failed requests for the last {Hours} hours", hours);
 
         var query = $"""
-            requests
-            | where timestamp > ago({hours}h)
-            | where success == false
+            AppRequests
+            | where TimeGenerated > ago({hours}h)
+            | where Success == false
             | summarize
                 FailureCount = count(),
-                AvgDurationMs = avg(duration),
-                P95DurationMs = percentile(duration, 95),
-                StatusCodes = make_set(resultCode),
-                SampleUrl = take_any(url)
-              by name
+                AvgDurationMs = avg(DurationMs),
+                P95DurationMs = percentile(DurationMs, 95),
+                StatusCodes = make_set(ResultCode),
+                SampleUrl = take_any(Url)
+              by Name
             | order by FailureCount desc
             | take {maxResults}
             """;
@@ -209,7 +276,7 @@ public sealed partial class AppInsightsPlugin(
 
             var results = response.Value.Table.Rows.Select(row => new
             {
-                Endpoint = row["name"]?.ToString(),
+                Endpoint = row["Name"]?.ToString(),
                 FailureCount = Convert.ToInt32(row["FailureCount"]),
                 AvgDurationMs = Convert.ToDouble(row["AvgDurationMs"]),
                 P95DurationMs = Convert.ToDouble(row["P95DurationMs"]),
@@ -240,14 +307,14 @@ public sealed partial class AppInsightsPlugin(
         _logger.LogInformation("Querying dependency failures for the last {Hours} hours", hours);
 
         var query = $"""
-            dependencies
-            | where timestamp > ago({hours}h)
-            | where success == false
+            AppDependencies
+            | where TimeGenerated > ago({hours}h)
+            | where Success == false
             | summarize
                 FailureCount = count(),
-                AvgDurationMs = avg(duration),
-                ResultCodes = make_set(resultCode)
-              by type, target, name
+                AvgDurationMs = avg(DurationMs),
+                ResultCodes = make_set(ResultCode)
+              by DependencyType, Target, Name
             | order by FailureCount desc
             | take {maxResults}
             """;
@@ -261,9 +328,9 @@ public sealed partial class AppInsightsPlugin(
 
             var results = response.Value.Table.Rows.Select(row => new
             {
-                Type = row["type"]?.ToString(),
-                Target = row["target"]?.ToString(),
-                Name = row["name"]?.ToString(),
+                Type = row["DependencyType"]?.ToString(),
+                Target = row["Target"]?.ToString(),
+                Name = row["Name"]?.ToString(),
                 FailureCount = Convert.ToInt32(row["FailureCount"]),
                 AvgDurationMs = Convert.ToDouble(row["AvgDurationMs"]),
                 ResultCodes = row["ResultCodes"]?.ToString()
@@ -290,17 +357,17 @@ public sealed partial class AppInsightsPlugin(
         _logger.LogInformation("Getting trace for operation {OperationId}", operationId);
 
         var query = $"""
-            union requests, dependencies, exceptions, traces
-            | where operation_Id == "{EscapeKql(operationId)}"
-            | order by timestamp asc
+            union AppRequests, AppDependencies, AppExceptions, AppTraces
+            | where OperationId == "{EscapeKql(operationId)}"
+            | order by TimeGenerated asc
             | project
-                Timestamp = timestamp,
-                ItemType = itemType,
-                Name = name,
-                Success = success,
-                Duration = duration,
-                Message = message,
-                Details = customDimensions
+                Timestamp = TimeGenerated,
+                ItemType = Type,
+                Name,
+                Success,
+                DurationMs,
+                Message,
+                Properties
             """;
 
         try
@@ -316,7 +383,7 @@ public sealed partial class AppInsightsPlugin(
                 ItemType = row["ItemType"]?.ToString(),
                 Name = row["Name"]?.ToString(),
                 Success = row["Success"]?.ToString(),
-                Duration = row["Duration"]?.ToString(),
+                DurationMs = row["DurationMs"]?.ToString(),
                 Message = row["Message"]?.ToString()
             }).ToList();
 
@@ -346,16 +413,16 @@ public sealed partial class AppInsightsPlugin(
             thresholdMs, hours);
 
         var query = $"""
-            requests
-            | where timestamp > ago({hours}h)
+            AppRequests
+            | where TimeGenerated > ago({hours}h)
             | summarize
                 RequestCount = count(),
-                AvgDurationMs = avg(duration),
-                P50DurationMs = percentile(duration, 50),
-                P95DurationMs = percentile(duration, 95),
-                P99DurationMs = percentile(duration, 99),
-                FailureRate = round(100.0 * countif(success == false) / count(), 2)
-              by name
+                AvgDurationMs = avg(DurationMs),
+                P50DurationMs = percentile(DurationMs, 50),
+                P95DurationMs = percentile(DurationMs, 95),
+                P99DurationMs = percentile(DurationMs, 99),
+                FailureRate = round(100.0 * countif(Success == false) / count(), 2)
+              by Name
             | where P95DurationMs > {thresholdMs}
             | order by P95DurationMs desc
             | take {maxResults}
@@ -370,7 +437,7 @@ public sealed partial class AppInsightsPlugin(
 
             var results = response.Value.Table.Rows.Select(row => new
             {
-                Operation = row["name"]?.ToString(),
+                Operation = row["Name"]?.ToString(),
                 RequestCount = Convert.ToInt32(row["RequestCount"]),
                 AvgDurationMs = Math.Round(Convert.ToDouble(row["AvgDurationMs"]), 2),
                 P50DurationMs = Math.Round(Convert.ToDouble(row["P50DurationMs"]), 2),
@@ -394,13 +461,58 @@ public sealed partial class AppInsightsPlugin(
     {
         if (string.IsNullOrEmpty(stackTrace)) return (null, null);
 
-        var match = StackTraceRegex().Match(stackTrace);
+        try
+        {
+            using var doc = JsonDocument.Parse(stackTrace);
 
+            if (doc.RootElement.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var exceptionObj in doc.RootElement.EnumerateArray())
+                {
+                    if (exceptionObj.TryGetProperty("parsedStack", out var parsedStack) &&
+                        parsedStack.ValueKind == JsonValueKind.Array)
+                    {
+                        foreach (var frame in parsedStack.EnumerateArray())
+                        {
+                            if (frame.TryGetProperty("fileName", out var fileName))
+                            {
+                                var fileStr = fileName.GetString();
+                                if (!string.IsNullOrEmpty(fileStr) && fileStr.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    var normalizedFile = NormalizeFilePath(fileStr);
+                                    var lineNum = frame.TryGetProperty("line", out var ln) && ln.ValueKind == JsonValueKind.Number
+                                        ? ln.GetInt32()
+                                        : (int?)null;
+                                    return (normalizedFile, lineNum);
+                                }
+                            }
+                        }
+                    }
+
+                    if (exceptionObj.TryGetProperty("fileName", out var directFileName))
+                    {
+                        var fileStr = directFileName.GetString();
+                        if (!string.IsNullOrEmpty(fileStr) && fileStr.EndsWith(".cs", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var normalizedFile = NormalizeFilePath(fileStr);
+                            var lineNum = exceptionObj.TryGetProperty("line", out var ln) && ln.ValueKind == JsonValueKind.Number
+                                ? ln.GetInt32()
+                                : (int?)null;
+                            return (normalizedFile, lineNum);
+                        }
+                    }
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+
+        var match = StackTraceRegex().Match(stackTrace);
         if (match.Success)
         {
-            var file = match.Groups[1].Value;
+            var file = NormalizeFilePath(match.Groups[1].Value);
             var line = int.TryParse(match.Groups[2].Value, out var l) ? l : (int?)null;
-            file = NormalizeFilePath(file);
             return (file, line);
         }
 

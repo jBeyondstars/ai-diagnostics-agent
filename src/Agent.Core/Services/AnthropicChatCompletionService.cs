@@ -1,13 +1,14 @@
-using System.Runtime.CompilerServices;
-using System.Text.Json;
-using System.Text.Json.Nodes;
 using Anthropic.SDK;
 using Anthropic.SDK.Constants;
 using Anthropic.SDK.Messaging;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.ChatCompletion;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using AnthropicTextContent = Anthropic.SDK.Messaging.TextContent;
+using Function = Anthropic.SDK.Common.Function;
 
 namespace Agent.Core.Services;
 
@@ -65,6 +66,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         {
             request.Tools = tools;
             request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
+            _logger?.LogInformation("Registered {ToolCount} tools for Claude", tools.Count);
         }
 
         _logger?.LogDebug("Sending request to Claude {Model} with {MessageCount} messages",
@@ -138,13 +140,20 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         }
     }
 
+    private const int MaxToolResultLength = 4000;
+    private const int MaxToolCallRounds = 50;
+
     private async Task<IReadOnlyList<ChatMessageContent>> HandleToolCallsAsync(
         MessageResponse response,
         ChatHistory chatHistory,
         Kernel kernel,
         PromptExecutionSettings? executionSettings,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int currentRound = 1,
+        List<Message>? accumulatedMessages = null)
     {
+        _logger?.LogInformation("Tool call round {Round}/{Max}", currentRound, MaxToolCallRounds);
+
         var toolResultContents = new List<ContentBase>();
         var assistantContent = new List<ContentBase>();
 
@@ -158,6 +167,12 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
                 var result = await InvokeKernelFunctionAsync(kernel, toolUse, cancellationToken);
 
+                // Truncate long results to save tokens
+                if (result.Length > MaxToolResultLength)
+                {
+                    result = result[..MaxToolResultLength] + "\n... (truncated)";
+                }
+
                 toolResultContents.Add(new ToolResultContent
                 {
                     ToolUseId = toolUse.Id,
@@ -170,7 +185,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
             }
         }
 
-        var newMessages = ConvertToAnthropicMessages(chatHistory);
+        var newMessages = accumulatedMessages ?? ConvertToAnthropicMessages(chatHistory);
 
         newMessages.Add(new Message
         {
@@ -204,9 +219,18 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
         if (followUpResponse.StopReason == "tool_use")
         {
-            var updatedHistory = new ChatHistory(chatHistory);
-            updatedHistory.AddAssistantMessage(ExtractTextContent(response));
-            return await HandleToolCallsAsync(followUpResponse, updatedHistory, kernel, executionSettings, cancellationToken);
+            if (currentRound >= MaxToolCallRounds)
+            {
+                _logger?.LogWarning("Max tool call rounds ({Max}) reached, forcing completion", MaxToolCallRounds);
+                followUpRequest.Tools = null;
+                followUpRequest.ToolChoice = null;
+                followUpResponse = await _client.Messages.GetClaudeMessageAsync(followUpRequest, cancellationToken);
+            }
+            else
+            {
+                return await HandleToolCallsAsync(followUpResponse, chatHistory, kernel, executionSettings,
+                    cancellationToken, currentRound + 1, newMessages);
+            }
         }
 
         return
@@ -275,8 +299,51 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
     private static List<Anthropic.SDK.Common.Tool>? ConvertKernelFunctionsToTools(Kernel kernel)
     {
-        // Tool support disabled for now 
-        return null;
+        var tools = new List<Anthropic.SDK.Common.Tool>();
+
+        foreach (var plugin in kernel.Plugins)
+        {
+            foreach (var function in plugin)
+            {
+                var toolName = $"{plugin.Name}_{function.Name}";
+                var description = function.Description ?? $"Function {function.Name} from plugin {plugin.Name}";
+
+                var properties = new JsonObject();
+                var required = new JsonArray();
+
+                foreach (var param in function.Metadata.Parameters)
+                {
+                    var paramSchema = new JsonObject
+                    {
+                        ["type"] = GetJsonType(param.ParameterType),
+                        ["description"] = param.Description ?? param.Name
+                    };
+
+                    properties[param.Name] = paramSchema;
+
+                    if (param.IsRequired)
+                    {
+                        required.Add(param.Name);
+                    }
+                }
+
+                var inputSchema = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = properties
+                };
+
+                if (required.Count > 0)
+                {
+                    inputSchema["required"] = required;
+                }
+
+                var tool = new Function(toolName, description, inputSchema);
+                tools.Add(tool);
+            }
+        }
+
+        return tools.Count > 0 ? tools : null;
     }
 
     private static string GetJsonType(Type? type)

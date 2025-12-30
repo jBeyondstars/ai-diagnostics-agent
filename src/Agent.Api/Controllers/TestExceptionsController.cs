@@ -215,3 +215,83 @@ public class OrderProcessingException(int orderId, string reason)
     public int OrderId { get; } = orderId;
     public string Reason { get; } = reason;
 }
+
+/// <summary>
+/// Controller simulating a real user service with actual bugs.
+/// </summary>
+[ApiController]
+[Route("api/[controller]")]
+public class UsersController(ILogger<UsersController> logger) : ControllerBase
+{
+    // Simulated user database
+    private static readonly Dictionary<int, User> _users = new()
+    {
+        [1] = new User { Id = 1, Name = "Alice", Email = "alice@example.com", Roles = ["admin", "user"] },
+        [2] = new User { Id = 2, Name = "Bob", Email = "bob@example.com", Roles = ["user"] },
+        [3] = new User { Id = 3, Name = "Charlie", Email = null, Roles = [] }  // Bug: null email
+    };
+
+    /// <summary>
+    /// Gets a user by ID - has a bug with null email handling
+    /// </summary>
+    [HttpGet("{id}")]
+    public ActionResult<UserDto> GetUser(int id)
+    {
+        logger.LogInformation("Fetching user {UserId}", id);
+
+        // BUG: No check if user exists
+        var user = _users[id];
+
+        // BUG: No null check on Email before calling ToUpper()
+        var normalizedEmail = user.Email.ToUpper();
+
+        return Ok(new UserDto
+        {
+            Id = user.Id,
+            Name = user.Name,
+            Email = normalizedEmail,
+            PrimaryRole = user.Roles[0]  // BUG: No check if Roles is empty
+        });
+    }
+
+    /// <summary>
+    /// Searches users by name - has index out of bounds bug
+    /// </summary>
+    [HttpGet("search")]
+    public ActionResult<List<UserDto>> SearchUsers([FromQuery] string query)
+    {
+        logger.LogInformation("Searching users with query: {Query}", query);
+
+        var results = _users.Values
+            .Where(u => u.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
+            .ToList();
+
+        // BUG: Assumes at least one result exists
+        var firstResult = results[0];
+        logger.LogInformation("First match: {Name}", firstResult.Name);
+
+        return Ok(results.Select(u => new UserDto
+        {
+            Id = u.Id,
+            Name = u.Name,
+            Email = u.Email ?? "N/A",
+            PrimaryRole = u.Roles.FirstOrDefault() ?? "none"
+        }).ToList());
+    }
+}
+
+public class User
+{
+    public int Id { get; set; }
+    public required string Name { get; set; }
+    public string? Email { get; set; }
+    public string[] Roles { get; set; } = [];
+}
+
+public class UserDto
+{
+    public int Id { get; set; }
+    public required string Name { get; set; }
+    public required string Email { get; set; }
+    public required string PrimaryRole { get; set; }
+}
