@@ -1,0 +1,115 @@
+### AI Diagnostics Agent - API Tests
+### Base URL (update port if needed)
+@baseUrl = http://localhost:5000
+
+### ============================================================================
+### Health & Status
+### ============================================================================
+
+### Get agent status
+GET {{baseUrl}}/api/diagnostics/status
+Accept: application/json
+
+### Test LLM connectivity
+GET {{baseUrl}}/api/diagnostics/test-llm
+Accept: application/json
+
+### Health check
+GET {{baseUrl}}/health
+Accept: application/json
+
+### ============================================================================
+### Diagnostics - Analysis Endpoints
+### ============================================================================
+
+### Quick scan (fast, minimal settings)
+POST {{baseUrl}}/api/diagnostics/quick-scan
+Accept: application/json
+
+### Full analysis with custom settings
+POST {{baseUrl}}/api/diagnostics/analyze
+Content-Type: application/json
+Accept: application/json
+
+{
+  "hoursToAnalyze": 24,
+  "minOccurrences": 5,
+  "maxExceptionsToAnalyze": 10,
+  "autoCreatePullRequests": false,
+  "autoCreateIssues": false
+}
+
+### Full analysis with PR creation enabled
+POST {{baseUrl}}/api/diagnostics/analyze
+Content-Type: application/json
+Accept: application/json
+
+{
+  "hoursToAnalyze": 48,
+  "minOccurrences": 10,
+  "maxExceptionsToAnalyze": 5,
+  "autoCreatePullRequests": true,
+  "autoCreateIssues": true
+}
+
+### ============================================================================
+### Test Exceptions - Generate errors for Application Insights
+### ============================================================================
+
+### Throw NullReferenceException
+GET {{baseUrl}}/api/testexceptions/null-reference
+Accept: application/json
+
+### Throw ArgumentException (missing required param)
+GET {{baseUrl}}/api/testexceptions/argument
+Accept: application/json
+
+### Throw ArgumentException (with param - should NOT throw)
+GET {{baseUrl}}/api/testexceptions/argument?value=test
+Accept: application/json
+
+### Throw InvalidOperationException
+GET {{baseUrl}}/api/testexceptions/invalid-operation
+Accept: application/json
+
+### Throw Business Exception (custom)
+GET {{baseUrl}}/api/testexceptions/business-error?orderId=99999
+Accept: application/json
+
+### Throw TimeoutException
+GET {{baseUrl}}/api/testexceptions/timeout
+Accept: application/json
+
+### Throw HttpRequestException (external API failure)
+GET {{baseUrl}}/api/testexceptions/external-api
+Accept: application/json
+
+### Throw DivideByZeroException
+GET {{baseUrl}}/api/testexceptions/divide-by-zero?numerator=42
+Accept: application/json
+
+### Throw FileNotFoundException
+GET {{baseUrl}}/api/testexceptions/file-not-found
+Accept: application/json
+
+### Throw AggregateException (multiple inner exceptions)
+GET {{baseUrl}}/api/testexceptions/aggregate
+Accept: application/json
+
+### Throw Random Exception
+GET {{baseUrl}}/api/testexceptions/random
+Accept: application/json
+
+### Generate Burst of Exceptions (for stress testing)
+POST {{baseUrl}}/api/testexceptions/burst?count=20
+Accept: application/json
+
+### ============================================================================
+### OpenAPI / Scalar UI
+### ============================================================================
+
+### Get OpenAPI spec
+GET {{baseUrl}}/openapi/v1.json
+Accept: application/json
+
+### Open Scalar UI in browser: http://localhost:5000/scalar/v1
