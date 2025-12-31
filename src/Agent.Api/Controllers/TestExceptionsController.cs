@@ -97,14 +97,45 @@ public class TestExceptionsController(ILogger<TestExceptionsController> logger) 
     /// </summary>
     [HttpGet("external-api")]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
-    public ActionResult ThrowHttpException()
+    public async Task<ActionResult> ThrowHttpException()
     {
         logger.LogInformation("Calling external payment API");
 
-        throw new HttpRequestException(
-            "Failed to connect to payment gateway at https://api.payments.example.com/v2/charge",
-            inner: null,
-            statusCode: System.Net.HttpStatusCode.ServiceUnavailable);
+        using var httpClient = new HttpClient();
+        httpClient.Timeout = TimeSpan.FromSeconds(5);
+        
+        try
+        {
+            var response = await httpClient.PostAsync(
+                "https://api.payments.example.com/v2/charge",
+                new StringContent("{\"amount\": 100}", System.Text.Encoding.UTF8, "application/json"));
+            
+            response.EnsureSuccessStatusCode();
+            
+            return Ok(new { status = "Payment processed" });
+        }
+        catch (HttpRequestException ex)
+        {
+            logger.LogError(ex, "Payment gateway request failed");
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, 
+                new ProblemDetails 
+                { 
+                    Title = "Payment Gateway Unavailable",
+                    Detail = "Unable to connect to payment gateway. Please try again later.",
+                    Status = StatusCodes.Status503ServiceUnavailable
+                });
+        }
+        catch (TaskCanceledException ex)
+        {
+            logger.LogError(ex, "Payment gateway request timed out");
+            return StatusCode(StatusCodes.Status504GatewayTimeout,
+                new ProblemDetails
+                {
+                    Title = "Payment Gateway Timeout",
+                    Detail = "Payment gateway did not respond in time.",
+                    Status = StatusCodes.Status504GatewayTimeout
+                });
+        }
     }
 
     /// <summary>
