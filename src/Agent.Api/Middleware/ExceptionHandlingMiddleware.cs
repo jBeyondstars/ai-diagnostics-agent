@@ -45,6 +45,7 @@ public class ExceptionHandlingMiddleware(
         {
             ArgumentNullException => (StatusCodes.Status400BadRequest, "Bad Request"),
             ArgumentException => (StatusCodes.Status400BadRequest, "Bad Request"),
+            DivideByZeroException => (StatusCodes.Status400BadRequest, "Bad Request"),
             UnauthorizedAccessException => (StatusCodes.Status401Unauthorized, "Unauthorized"),
             KeyNotFoundException => (StatusCodes.Status404NotFound, "Not Found"),
             FileNotFoundException => (StatusCodes.Status404NotFound, "Not Found"),
