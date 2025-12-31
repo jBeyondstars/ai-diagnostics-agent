@@ -41,6 +41,13 @@ public class ExceptionHandlingMiddleware(
             context.Request.Method,
             context.User.Identity?.Name ?? "anonymous");
 
+        // Check if response has already started
+        if (context.Response.HasStarted)
+        {
+            logger.LogWarning("Cannot write error response - response has already started. TraceId: {TraceId}", traceId);
+            return;
+        }
+
         var (statusCode, title) = exception switch
         {
             ArgumentNullException => (StatusCodes.Status400BadRequest, "Bad Request"),
@@ -86,10 +93,12 @@ public class ExceptionHandlingMiddleware(
                 .ToList();
         }
 
+        context.Response.Clear();
         context.Response.StatusCode = statusCode;
         context.Response.ContentType = "application/problem+json";
 
-        await context.Response.WriteAsync(JsonSerializer.Serialize(problemDetails, JsonOptions));
+        var json = JsonSerializer.Serialize(problemDetails, JsonOptions);
+        await context.Response.WriteAsync(json);
     }
 }
 
