@@ -103,7 +103,12 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
             return NotFound(new { message = $"Order {orderId} not found" });
         }
 
-        // BUG: Order 1003 has empty Items list - .First() will throw InvalidOperationException
+        // Check if order has any items before accessing first item
+        if (order.Items.Count == 0)
+        {
+            return NotFound(new { message = $"Order {orderId} has no items" });
+        }
+
         var firstItem = order.Items.First();
 
         return Ok(new OrderItemDto
