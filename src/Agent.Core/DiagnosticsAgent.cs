@@ -693,6 +693,7 @@ public sealed class DiagnosticsAgent(
             var ex = exceptions[0];
             var exceptionName = ex.ExceptionType.Split('.').Last();
 
+// Extract controller name from source file (e.g., "OrdersController" from ".../OrdersController.cs")
             var controllerName = "";
             if (!string.IsNullOrEmpty(ex.SourceFile))
             {
@@ -703,6 +704,7 @@ public sealed class DiagnosticsAgent(
                 }
             }
 
+// Extract endpoint from OperationName (e.g., "GET /api/orders/customer/{id}/average")
             var endpoint = "";
             if (!string.IsNullOrEmpty(ex.OperationName))
             {
@@ -712,6 +714,7 @@ public sealed class DiagnosticsAgent(
                     : ex.OperationName;
             }
 
+// Build title with available context
             if (!string.IsNullOrEmpty(controllerName) && !string.IsNullOrEmpty(endpoint))
             {
                 return $"fix({controllerName}): {exceptionName} in {endpoint}";
