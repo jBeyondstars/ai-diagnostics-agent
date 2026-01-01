@@ -49,13 +49,19 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
     {
         logger.LogInformation("Parsing order date: {DateString}", dateString);
 
+        // FIX: Add null check before accessing dateString properties
+        if (dateString == null)
+        {
+            logger.LogWarning("Null dateString provided");
+            return BadRequest("Date string cannot be null");
+        }
+
         // BUG: No validation - throws FormatException on invalid input
         var parsedDate = DateTime.Parse(dateString);
 
         var dayOfWeek = parsedDate.DayOfWeek;
         var isWeekend = dayOfWeek == DayOfWeek.Saturday || dayOfWeek == DayOfWeek.Sunday;
 
-        // BUG: No null check on dateString before using Length
         var inputLength = dateString.Length;
 
         return Ok(new OrderDateInfo
@@ -65,6 +71,31 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
             DayOfWeek = dayOfWeek.ToString(),
             IsWeekend = isWeekend,
             InputLength = inputLength
+        });
+    }
+
+    /// <summary>
+    /// Get shipping information for an order.
+    /// </summary>
+    [HttpGet("{orderId}/shipping")]
+    public ActionResult<object> GetShippingInfo(int orderId)
+    {
+        logger.LogInformation("Getting shipping info for order {OrderId}", orderId);
+
+        var order = _orders.FirstOrDefault(o => o.Id == orderId);
+        
+        // FIX: Add null check for order before accessing properties
+        if (order == null)
+        {
+            logger.LogWarning("Order {OrderId} not found", orderId);
+            return NotFound($"Order {orderId} not found");
+        }
+
+        return Ok(new
+        {
+            OrderId = order.Id,
+            Status = order.Status,
+            ItemCount = order.Items?.Length ?? 0
         });
     }
 }
