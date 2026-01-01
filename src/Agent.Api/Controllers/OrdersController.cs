@@ -55,8 +55,8 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
         var dayOfWeek = parsedDate.DayOfWeek;
         var isWeekend = dayOfWeek == DayOfWeek.Saturday || dayOfWeek == DayOfWeek.Sunday;
 
-        // BUG: No null check on dateString before using Length
-        var inputLength = dateString.Length;
+        // Fixed: Add null check before accessing Length
+        var inputLength = dateString?.Length ?? 0;
 
         return Ok(new OrderDateInfo
         {
