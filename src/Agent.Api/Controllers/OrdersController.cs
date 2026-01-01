@@ -49,13 +49,21 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
     {
         logger.LogInformation("Parsing order date: {DateString}", dateString);
 
-        // BUG: No validation - throws FormatException on invalid input
-        var parsedDate = DateTime.Parse(dateString);
+        // Validate input and use TryParse to handle invalid formats gracefully
+        if (string.IsNullOrWhiteSpace(dateString))
+        {
+            return BadRequest(new { error = "Date string cannot be null or empty" });
+        }
+
+        if (!DateTime.TryParse(dateString, out var parsedDate))
+        {
+            return BadRequest(new { error = $"Invalid date format: '{dateString}'" });
+        }
 
         var dayOfWeek = parsedDate.DayOfWeek;
         var isWeekend = dayOfWeek == DayOfWeek.Saturday || dayOfWeek == DayOfWeek.Sunday;
 
-        // BUG: No null check on dateString before using Length
+        // Safe to access Length here since we validated dateString is not null above
         var inputLength = dateString.Length;
 
         return Ok(new OrderDateInfo
