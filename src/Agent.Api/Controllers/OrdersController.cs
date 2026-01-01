@@ -30,7 +30,12 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
 
         var customerOrders = _orders.Where(o => o.CustomerId == customerId).ToList();
 
-        // BUG: Division by zero when customer has no orders
+        if (customerOrders.Count == 0)
+        {
+            logger.LogWarning("No orders found for customer {CustomerId}", customerId);
+            return Ok(0m);
+        }
+
         var totalValue = customerOrders.Sum(o => o.Total);
         var averageValue = totalValue / customerOrders.Count;
 
