@@ -29,7 +29,11 @@ else
 
 builder.Services.AddSingleton<DiagnosticsAgent>();
 
-builder.Services.AddControllers()
+builder.Services.AddControllers(options =>
+    {
+        // Register custom model binder for flexible DateTime parsing
+        options.ModelBinderProviders.Insert(0, new Agent.Api.ModelBinders.FlexibleDateTimeModelBinderProvider());
+    })
     .AddJsonOptions(options =>
     {
         options.JsonSerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase;
