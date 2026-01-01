@@ -19,9 +19,9 @@
 │   │ Webhook trigger                                                                          │
 │   ▼                                                                                          │
 │   ┌──────────────┐    ┌───────────────┐    ┌─────────────┐    ┌─────────────────────┐       │
-│   │   Action     │    │  AI Agent     │    │  Exception  │    │   Claude Sonnet     │       │
-│   │   Group      │───▶│   API         │───▶│  Filter     │───▶│   4 (analyze)       │       │
-│   │  (webhook)   │    │  (Container)  │    │             │    │                     │       │
+│   │   Action     │    │  AI Agent     │    │  Exception  │    │   Claude            │       │
+│   │   Group      │───▶│   API         │───▶│  Filter     │───▶│(or your LLM choice)       │
+│   │  (webhook)   │    │  (Container)  │    │             │    │     (analyze)       │       │
 │   └──────────────┘    └───────────────┘    └──────┬──────┘    └──────────┬──────────┘       │
 │                              │                    │                      │                   │
 │                              ▼                    │ Skip infra           ▼                   │
