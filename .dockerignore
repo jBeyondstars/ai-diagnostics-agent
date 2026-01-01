@@ -1,0 +1,12 @@
+.vs/
+.vscode/
+bin/
+obj/
+*.user
+*.suo
+.git/
+.gitignore
+.azure/
+*.md
+infra/
+tests/

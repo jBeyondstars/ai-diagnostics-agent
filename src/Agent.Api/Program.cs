@@ -1,22 +1,34 @@
 using Agent.Api.Middleware;
 using Agent.Core;
 using Agent.Core.Configuration;
+using Agent.Core.Services;
 using Scalar.AspNetCore;
 
 var builder = WebApplication.CreateBuilder(args);
-
-// ============================================================================
-// Service Configuration
-// ============================================================================
 
 builder.AddServiceDefaults();
 
 builder.Services.Configure<AgentConfiguration>(
     builder.Configuration.GetSection(AgentConfiguration.SectionName));
 
+var redisConnection = builder.Configuration.GetValue<string>("Agent:Redis:ConnectionString");
+if (!string.IsNullOrEmpty(redisConnection))
+{
+    builder.Services.AddStackExchangeRedisCache(options =>
+    {
+        options.Configuration = redisConnection;
+        options.InstanceName = "ai-diagnostics-agent:";
+    });
+    builder.Services.AddSingleton<DeduplicationService>();
+}
+else
+{
+    builder.Services.AddDistributedMemoryCache();
+    builder.Services.AddSingleton<DeduplicationService>();
+}
+
 builder.Services.AddSingleton<DiagnosticsAgent>();
 
-// Add Controllers with JSON options
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {
@@ -24,7 +36,6 @@ builder.Services.AddControllers()
         options.JsonSerializerOptions.WriteIndented = true;
     });
 
-// OpenAPI configuration
 builder.Services.AddOpenApi(options =>
 {
     options.AddDocumentTransformer((document, context, ct) =>
@@ -48,33 +59,35 @@ builder.Services.AddOpenApi(options =>
 // Add ProblemDetails for consistent error responses
 builder.Services.AddProblemDetails();
 
+// CORS for Scalar UI
+builder.Services.AddCors(options =>
+{
+    options.AddDefaultPolicy(policy =>
+    {
+        policy.AllowAnyOrigin()
+              .AllowAnyMethod()
+              .AllowAnyHeader();
+    });
+});
+
 var app = builder.Build();
 
-// ============================================================================
-// Middleware Pipeline
-// ============================================================================
-
-// Global exception handler (must be first)
 app.UseGlobalExceptionHandler();
 
-// OpenAPI and Scalar UI
+app.UseCors();
+
 app.MapOpenApi();
 app.MapScalarApiReference(options =>
 {
     options.Title = "AI Diagnostics Agent";
     options.Theme = ScalarTheme.BluePlanet;
     options.DefaultHttpClient = new(ScalarTarget.CSharp, ScalarClient.HttpClient);
+    options.ProxyUrl = null;
 });
 
-// Health checks and service defaults
 app.MapDefaultEndpoints();
 
-// Map Controllers
 app.MapControllers();
-
-// ============================================================================
-// Root redirect to Scalar UI
-// ============================================================================
 
 app.MapGet("/", () => Results.Redirect("/scalar/v1"))
     .ExcludeFromDescription();

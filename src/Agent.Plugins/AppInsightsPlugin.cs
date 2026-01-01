@@ -25,10 +25,14 @@ public sealed partial class AppInsightsPlugin(
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
-    private static readonly FrozenSet<string> CommonPathPrefixes = new[]
-    {
-        "/src/", "/app/", "/home/", "/_/src/"
-    }.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+    // Common container path prefixes to strip
+    private static readonly string[] CommonPathPrefixes =
+    [
+        "/_/src/",
+        "/src/",
+        "/app/",
+        "/home/"
+    ];
 
     /// <summary>
     /// Gets the most recent exception from Application Insights
@@ -528,7 +532,8 @@ public sealed partial class AppInsightsPlugin(
             var idx = path.IndexOf(prefix, StringComparison.OrdinalIgnoreCase);
             if (idx >= 0)
             {
-                return path[(idx + 1)..];
+                // Skip the entire prefix (e.g., "/src/src/" -> "Agent.Api/...")
+                return path[(idx + prefix.Length)..];
             }
         }
 
