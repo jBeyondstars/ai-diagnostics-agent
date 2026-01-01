@@ -16,28 +16,18 @@ namespace Agent.Core.Services;
 /// Custom IChatCompletionService implementation for Anthropic Claude.
 /// Bridges Semantic Kernel with the Anthropic SDK v5.8+.
 /// </summary>
-public sealed class AnthropicChatCompletionService : IChatCompletionService
+public sealed class AnthropicChatCompletionService(
+    string apiKey,
+    string modelId = AnthropicModels.Claude41Opus,
+    ILogger? logger = null) : IChatCompletionService
 {
-    private readonly AnthropicClient _client;
-    private readonly string _modelId;
-    private readonly ILogger? _logger;
+    private readonly AnthropicClient _client = new(apiKey);
 
-    private readonly Dictionary<string, object?> _attributes = new();
-
-    public IReadOnlyDictionary<string, object?> Attributes => _attributes;
-
-    public AnthropicChatCompletionService(
-        string apiKey,
-        string modelId = AnthropicModels.Claude41Opus,
-        ILogger? logger = null)
+    public IReadOnlyDictionary<string, object?> Attributes { get; } = new Dictionary<string, object?>
     {
-        _client = new AnthropicClient(apiKey);
-        _modelId = modelId;
-        _logger = logger;
-
-        _attributes["ModelId"] = modelId;
-        _attributes["ServiceType"] = "Anthropic";
-    }
+        ["ModelId"] = modelId,
+        ["ServiceType"] = "Anthropic"
+    };
 
     public async Task<IReadOnlyList<ChatMessageContent>> GetChatMessageContentsAsync(
         ChatHistory chatHistory,
@@ -51,7 +41,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
         var request = new MessageParameters
         {
-            Model = _modelId,
+            Model = modelId,
             MaxTokens = GetMaxTokens(executionSettings),
             Messages = messages,
             Temperature = GetTemperature(executionSettings)
@@ -62,15 +52,15 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
             request.System = [new SystemMessage(systemPrompt)];
         }
 
-        if (tools is not null && tools.Count > 0)
+        if (tools is { Count: > 0 })
         {
             request.Tools = tools;
             request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
-            _logger?.LogInformation("Registered {ToolCount} tools for Claude", tools.Count);
+            logger?.LogInformation("Registered {ToolCount} tools for Claude", tools.Count);
         }
 
-        _logger?.LogDebug("Sending request to Claude {Model} with {MessageCount} messages",
-            _modelId, messages.Count);
+        logger?.LogDebug("Sending request to Claude {Model} with {MessageCount} messages",
+            modelId, messages.Count);
 
         var response = await _client.Messages.GetClaudeMessageAsync(request, cancellationToken);
 
@@ -85,7 +75,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         [
             new ChatMessageContent(AuthorRole.Assistant, content)
             {
-                ModelId = _modelId,
+                ModelId = modelId,
                 Metadata = new Dictionary<string, object?>
                 {
                     ["StopReason"] = response.StopReason,
@@ -108,7 +98,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
         var request = new MessageParameters
         {
-            Model = _modelId,
+            Model = modelId,
             MaxTokens = GetMaxTokens(executionSettings),
             Messages = messages,
             Temperature = GetTemperature(executionSettings),
@@ -134,7 +124,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
                     AuthorRole.Assistant,
                     response.Delta.Text)
                 {
-                    ModelId = _modelId
+                    ModelId = modelId
                 };
             }
         }
@@ -152,7 +142,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         int currentRound = 1,
         List<Message>? accumulatedMessages = null)
     {
-        _logger?.LogInformation("Tool call round {Round}/{Max}", currentRound, MaxToolCallRounds);
+        logger?.LogInformation("Tool call round {Round}/{Max}", currentRound, MaxToolCallRounds);
 
         var toolResultContents = new List<ContentBase>();
         var assistantContent = new List<ContentBase>();
@@ -163,7 +153,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
             {
                 assistantContent.Add(toolUse);
 
-                _logger?.LogInformation("Claude calling tool: {ToolName}", toolUse.Name);
+                logger?.LogInformation("Claude calling tool: {ToolName}", toolUse.Name);
 
                 var result = await InvokeKernelFunctionAsync(kernel, toolUse, cancellationToken);
 
@@ -201,7 +191,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
         var followUpRequest = new MessageParameters
         {
-            Model = _modelId,
+            Model = modelId,
             MaxTokens = GetMaxTokens(executionSettings),
             Messages = newMessages,
             Temperature = GetTemperature(executionSettings),
@@ -221,7 +211,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         {
             if (currentRound >= MaxToolCallRounds)
             {
-                _logger?.LogWarning("Max tool call rounds ({Max}) reached, forcing completion", MaxToolCallRounds);
+                logger?.LogWarning("Max tool call rounds ({Max}) reached, forcing completion", MaxToolCallRounds);
                 followUpRequest.Tools = null;
                 followUpRequest.ToolChoice = null;
                 followUpResponse = await _client.Messages.GetClaudeMessageAsync(followUpRequest, cancellationToken);
@@ -274,7 +264,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
 
             if (function is null)
             {
-                _logger?.LogWarning("Function not found: {FunctionName}", toolUse.Name);
+                logger?.LogWarning("Function not found: {FunctionName}", toolUse.Name);
                 return JsonSerializer.Serialize(new { error = $"Function '{toolUse.Name}' not found" });
             }
 
@@ -292,7 +282,7 @@ public sealed class AnthropicChatCompletionService : IChatCompletionService
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Error invoking function {FunctionName}", toolUse.Name);
+            logger?.LogError(ex, "Error invoking function {FunctionName}", toolUse.Name);
             return JsonSerializer.Serialize(new { error = ex.Message });
         }
     }

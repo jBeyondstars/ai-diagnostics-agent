@@ -23,8 +23,6 @@ public sealed class SeqLogProvider(
     // Note: In a real implementation, inject Seq.Api.SeqConnection
     // private readonly SeqConnection _connection = new(serverUrl, apiKey);
 
-    private readonly string _serverUrl = serverUrl;
-    private readonly string? _apiKey = apiKey;
     private readonly ILogger<SeqLogProvider> _logger = logger
         ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<SeqLogProvider>.Instance;
 

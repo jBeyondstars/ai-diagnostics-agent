@@ -13,11 +13,11 @@ public sealed class DiagnosticsWorker(
     IOptions<AgentConfiguration> config,
     ILogger<DiagnosticsWorker> logger) : BackgroundService
 {
-    private readonly ScheduleConfiguration _schedule = config.Value.Schedule;
+    private ScheduleConfiguration Schedule => config.Value.Schedule;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        logger.LogInformation("Diagnostics Worker started. Running every {Hours} hours.", _schedule.IntervalHours);
+        logger.LogInformation("Diagnostics Worker started. Running every {Hours} hours.", Schedule.IntervalHours);
 
         await Task.Delay(TimeSpan.FromSeconds(30), stoppingToken);
 
@@ -43,7 +43,7 @@ public sealed class DiagnosticsWorker(
                 logger.LogInformation("Skipping run due to quiet hours or weekend restrictions");
             }
 
-            var nextRun = TimeSpan.FromHours(_schedule.IntervalHours);
+            var nextRun = TimeSpan.FromHours(Schedule.IntervalHours);
             logger.LogInformation("Next analysis scheduled at {NextRun}",
                 DateTime.UtcNow.Add(nextRun).ToString("yyyy-MM-dd HH:mm:ss UTC"));
 
@@ -57,12 +57,12 @@ public sealed class DiagnosticsWorker(
     {
         var now = DateTime.UtcNow;
 
-        if (!_schedule.EnableWeekendRuns && now.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+        if (!Schedule.EnableWeekendRuns && now.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
         {
             return false;
         }
 
-        if (_schedule.QuietHoursStart is { } start && _schedule.QuietHoursEnd is { } end)
+        if (Schedule.QuietHoursStart is { } start && Schedule.QuietHoursEnd is { } end)
         {
             var currentTime = TimeOnly.FromDateTime(now);
             if (start < end)
@@ -86,11 +86,11 @@ public sealed class DiagnosticsWorker(
 
         var request = new AnalysisRequest
         {
-            HoursToAnalyze = _schedule.HoursToAnalyze,
-            CreatePullRequest = _schedule.AutoCreatePullRequests,
-            CreateIssues = _schedule.AutoCreateIssues,
-            MinOccurrences = _schedule.MinExceptionOccurrences,
-            MaxExceptionsToAnalyze = _schedule.MaxExceptionsPerRun
+            HoursToAnalyze = Schedule.HoursToAnalyze,
+            CreatePullRequest = Schedule.AutoCreatePullRequests,
+            CreateIssues = Schedule.AutoCreateIssues,
+            MinOccurrences = Schedule.MinExceptionOccurrences,
+            MaxExceptionsToAnalyze = Schedule.MaxExceptionsPerRun
         };
 
         var startTime = DateTime.UtcNow;

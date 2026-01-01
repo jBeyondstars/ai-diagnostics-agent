@@ -19,9 +19,7 @@ public sealed partial class AppInsightsPlugin(
     ILogger<AppInsightsPlugin>? logger = null)
 {
     private readonly LogsQueryClient _logsClient = new(new DefaultAzureCredential());
-    private readonly string _workspaceId = workspaceId;
-    private readonly ILogger<AppInsightsPlugin> _logger = logger
-        ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AppInsightsPlugin>.Instance;
+    private readonly ILogger<AppInsightsPlugin> _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<AppInsightsPlugin>.Instance;
 
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
@@ -55,17 +53,19 @@ public sealed partial class AppInsightsPlugin(
                 LastSeen = TimeGenerated,
                 Message = OuterMessage,
                 StackTrace = Details,
-                OperationName
+                OperationName,
+                ItemId = _ItemId,
+                Timestamp = TimeGenerated
             """;
 
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row =>
+            List<object> results = [.. response.Value.Table.Rows.Select(row =>
             {
                 var stackTrace = row["StackTrace"]?.ToString() ?? "";
                 var (sourceFile, lineNumber) = ParseStackTrace(stackTrace);
@@ -82,9 +82,11 @@ public sealed partial class AppInsightsPlugin(
                     StackTrace = TruncateStackTrace(stackTrace, 2000),
                     OperationName = row["OperationName"]?.ToString(),
                     SourceFile = sourceFile,
-                    LineNumber = lineNumber
+                    LineNumber = lineNumber,
+                    ItemId = row["ItemId"]?.ToString(),
+                    Timestamp = row["Timestamp"]?.ToString()
                 };
-            }).ToList();
+            })];
 
             _logger.LogInformation("Found {Count} exception(s)", results.Count);
 
@@ -122,7 +124,9 @@ public sealed partial class AppInsightsPlugin(
                 LastSeen = max(TimeGenerated),
                 SampleMessage = take_any(OuterMessage),
                 SampleStackTrace = take_any(Details),
-                SampleOperation = take_any(OperationName)
+                SampleOperation = take_any(OperationName),
+                SampleItemId = take_any(_ItemId),
+                SampleTimestamp = take_any(TimeGenerated)
               by ExceptionType, ProblemId
             | where OccurrenceCount >= {minOccurrences}
             | order by OccurrenceCount desc
@@ -136,17 +140,19 @@ public sealed partial class AppInsightsPlugin(
                 LastSeen,
                 Message = SampleMessage,
                 StackTrace = SampleStackTrace,
-                OperationName = SampleOperation
+                OperationName = SampleOperation,
+                ItemId = SampleItemId,
+                Timestamp = SampleTimestamp
             """;
 
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row =>
+            List<object> results = [.. response.Value.Table.Rows.Select(row =>
             {
                 var stackTrace = row["StackTrace"]?.ToString() ?? "";
                 var (sourceFile, lineNumber) = ParseStackTrace(stackTrace);
@@ -163,9 +169,11 @@ public sealed partial class AppInsightsPlugin(
                     StackTrace = TruncateStackTrace(stackTrace, 2000),
                     OperationName = row["OperationName"]?.ToString(),
                     SourceFile = sourceFile,
-                    LineNumber = lineNumber
+                    LineNumber = lineNumber,
+                    ItemId = row["ItemId"]?.ToString(),
+                    Timestamp = row["Timestamp"]?.ToString()
                 };
-            }).ToList();
+            })];
 
             _logger.LogInformation("Found {Count} exception types", results.Count);
 
@@ -173,11 +181,11 @@ public sealed partial class AppInsightsPlugin(
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Error querying Application Insights. WorkspaceId: {WorkspaceId}", _workspaceId);
+            _logger.LogError(ex, "Error querying Application Insights. WorkspaceId: {WorkspaceId}", workspaceId);
             return JsonSerializer.Serialize(new
             {
                 error = ex.Message,
-                workspaceId = _workspaceId,
+                workspaceId = workspaceId,
                 innerError = ex.InnerException?.Message
             }, JsonOptions);
         }
@@ -219,11 +227,11 @@ public sealed partial class AppInsightsPlugin(
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row => new
+            List<object> results = [.. response.Value.Table.Rows.Select(row => new
             {
                 Timestamp = row["Timestamp"]?.ToString(),
                 OperationId = row["OperationId"]?.ToString(),
@@ -232,7 +240,7 @@ public sealed partial class AppInsightsPlugin(
                 InnerMessage = row["InnerMessage"]?.ToString(),
                 StackTrace = row["StackTrace"]?.ToString(),
                 CustomDimensions = row["CustomDimensions"]?.ToString()
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }
@@ -274,11 +282,11 @@ public sealed partial class AppInsightsPlugin(
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row => new
+            List<object> results = [.. response.Value.Table.Rows.Select(row => new
             {
                 Endpoint = row["Name"]?.ToString(),
                 FailureCount = Convert.ToInt32(row["FailureCount"]),
@@ -286,7 +294,7 @@ public sealed partial class AppInsightsPlugin(
                 P95DurationMs = Convert.ToDouble(row["P95DurationMs"]),
                 StatusCodes = row["StatusCodes"]?.ToString(),
                 SampleUrl = row["SampleUrl"]?.ToString()
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }
@@ -326,11 +334,11 @@ public sealed partial class AppInsightsPlugin(
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row => new
+            List<object> results = [.. response.Value.Table.Rows.Select(row => new
             {
                 Type = row["DependencyType"]?.ToString(),
                 Target = row["Target"]?.ToString(),
@@ -338,7 +346,7 @@ public sealed partial class AppInsightsPlugin(
                 FailureCount = Convert.ToInt32(row["FailureCount"]),
                 AvgDurationMs = Convert.ToDouble(row["AvgDurationMs"]),
                 ResultCodes = row["ResultCodes"]?.ToString()
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }
@@ -377,11 +385,11 @@ public sealed partial class AppInsightsPlugin(
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromDays(7)));
 
-            var results = response.Value.Table.Rows.Select(row => new
+            List<object> results = [.. response.Value.Table.Rows.Select(row => new
             {
                 Timestamp = row["Timestamp"]?.ToString(),
                 ItemType = row["ItemType"]?.ToString(),
@@ -389,7 +397,7 @@ public sealed partial class AppInsightsPlugin(
                 Success = row["Success"]?.ToString(),
                 DurationMs = row["DurationMs"]?.ToString(),
                 Message = row["Message"]?.ToString()
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }
@@ -435,11 +443,11 @@ public sealed partial class AppInsightsPlugin(
         try
         {
             var response = await _logsClient.QueryWorkspaceAsync(
-                _workspaceId,
+                workspaceId,
                 query,
                 new QueryTimeRange(TimeSpan.FromHours(hours)));
 
-            var results = response.Value.Table.Rows.Select(row => new
+            List<object> results = [.. response.Value.Table.Rows.Select(row => new
             {
                 Operation = row["Name"]?.ToString(),
                 RequestCount = Convert.ToInt32(row["RequestCount"]),
@@ -448,7 +456,7 @@ public sealed partial class AppInsightsPlugin(
                 P95DurationMs = Math.Round(Convert.ToDouble(row["P95DurationMs"]), 2),
                 P99DurationMs = Math.Round(Convert.ToDouble(row["P99DurationMs"]), 2),
                 FailureRate = Convert.ToDouble(row["FailureRate"])
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }

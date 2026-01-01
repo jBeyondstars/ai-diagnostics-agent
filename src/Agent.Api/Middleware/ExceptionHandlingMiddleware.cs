@@ -70,7 +70,7 @@ public class ExceptionHandlingMiddleware(
         problemDetails.Extensions["timestamp"] = DateTimeOffset.UtcNow;
         problemDetails.Extensions["exceptionType"] = exception.GetType().Name;
 
-        if (exception.InnerException != null)
+        if (exception.InnerException is not null)
         {
             problemDetails.Extensions["innerException"] = new
             {
@@ -81,9 +81,8 @@ public class ExceptionHandlingMiddleware(
 
         if (exception is AggregateException aggEx)
         {
-            problemDetails.Extensions["innerExceptions"] = aggEx.InnerExceptions
-                .Select(e => new { type = e.GetType().Name, message = e.Message })
-                .ToList();
+            problemDetails.Extensions["innerExceptions"] = (List<object>)[.. aggEx.InnerExceptions
+                .Select(e => new { type = e.GetType().Name, message = e.Message })];
         }
 
         context.Response.StatusCode = statusCode;

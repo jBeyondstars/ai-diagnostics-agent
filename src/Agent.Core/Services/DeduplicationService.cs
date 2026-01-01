@@ -3,22 +3,10 @@ using Microsoft.Extensions.Logging;
 
 namespace Agent.Core.Services;
 
-public class DeduplicationService
+public class DeduplicationService(IDistributedCache cache, ILogger<DeduplicationService> logger)
 {
-    private readonly IDistributedCache _cache;
-    private readonly ILogger<DeduplicationService> _logger;
     private readonly TimeSpan _defaultCooldown = TimeSpan.FromHours(6);
 
-    public DeduplicationService(IDistributedCache cache, ILogger<DeduplicationService> logger)
-    {
-        _cache = cache;
-        _logger = logger;
-    }
-
-    /// <summary>
-    /// Check if an exception should be analyzed based on its problemId.
-    /// Returns true if it should be analyzed, false if it was recently analyzed.
-    /// </summary>
     public async Task<bool> ShouldAnalyzeAsync(string problemId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(problemId))
@@ -28,11 +16,11 @@ public class DeduplicationService
 
         try
         {
-            var existing = await _cache.GetStringAsync(key, cancellationToken);
+            var existing = await cache.GetStringAsync(key, cancellationToken);
 
-            if (existing != null)
+            if (existing is not null)
             {
-                _logger.LogInformation("Skipping analysis for {ProblemId} - analyzed at {Time}",
+                logger.LogInformation("Skipping analysis for {ProblemId} - analyzed at {Time}",
                     problemId, existing);
                 return false;
             }
@@ -41,14 +29,11 @@ public class DeduplicationService
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Redis check failed for {ProblemId}, allowing analysis", problemId);
+            logger.LogWarning(ex, "Redis check failed for {ProblemId}, allowing analysis", problemId);
             return true;
         }
     }
 
-    /// <summary>
-    /// Mark an exception as analyzed to prevent re-analysis within the cooldown period.
-    /// </summary>
     public async Task MarkAsAnalyzedAsync(string problemId, TimeSpan? cooldown = null, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(problemId))
@@ -59,7 +44,7 @@ public class DeduplicationService
 
         try
         {
-            await _cache.SetStringAsync(
+            await cache.SetStringAsync(
                 key,
                 DateTime.UtcNow.ToString("O"),
                 new DistributedCacheEntryOptions
@@ -68,18 +53,15 @@ public class DeduplicationService
                 },
                 cancellationToken);
 
-            _logger.LogInformation("Marked {ProblemId} as analyzed (cooldown: {Hours}h)",
+            logger.LogInformation("Marked {ProblemId} as analyzed (cooldown: {Hours}h)",
                 problemId, duration.TotalHours);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to mark {ProblemId} as analyzed in Redis", problemId);
+            logger.LogWarning(ex, "Failed to mark {ProblemId} as analyzed in Redis", problemId);
         }
     }
 
-    /// <summary>
-    /// Clear the analysis marker for a specific exception (e.g., if PR was rejected).
-    /// </summary>
     public async Task ClearAsync(string problemId, CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(problemId))
@@ -89,14 +71,76 @@ public class DeduplicationService
 
         try
         {
-            await _cache.RemoveAsync(key, cancellationToken);
-            _logger.LogInformation("Cleared analysis marker for {ProblemId}", problemId);
+            await cache.RemoveAsync(key, cancellationToken);
+            logger.LogInformation("Cleared analysis marker for {ProblemId}", problemId);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to clear {ProblemId} from Redis", problemId);
+            logger.LogWarning(ex, "Failed to clear {ProblemId} from Redis", problemId);
+        }
+    }
+
+    public async Task ClearByPatternAsync(string pattern, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(pattern))
+            return;
+
+        try
+        {
+            var indexKey = GetIndexKey(pattern);
+            var indexValue = await cache.GetStringAsync(indexKey, cancellationToken);
+
+            if (!string.IsNullOrEmpty(indexValue))
+            {
+                var problemIds = indexValue.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                foreach (var problemId in problemIds)
+                {
+                    await cache.RemoveAsync(GetCacheKey(problemId.Trim()), cancellationToken);
+                }
+                await cache.RemoveAsync(indexKey, cancellationToken);
+                logger.LogInformation("Cleared {Count} entries for pattern {Pattern}", problemIds.Length, pattern);
+            }
+            else
+            {
+                await cache.RemoveAsync(GetCacheKey(pattern), cancellationToken);
+                logger.LogInformation("Cleared simple key for pattern {Pattern}", pattern);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to clear pattern {Pattern} from Redis", pattern);
+        }
+    }
+
+    public async Task AddToIndexAsync(string exceptionType, string problemId, CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(exceptionType) || string.IsNullOrEmpty(problemId))
+            return;
+
+        try
+        {
+            var indexKey = GetIndexKey(exceptionType);
+            var existing = await cache.GetStringAsync(indexKey, cancellationToken) ?? "";
+
+            if (!existing.Contains(problemId))
+            {
+                var newValue = string.IsNullOrEmpty(existing) ? problemId : $"{existing},{problemId}";
+                await cache.SetStringAsync(
+                    indexKey,
+                    newValue,
+                    new DistributedCacheEntryOptions
+                    {
+                        AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(48)
+                    },
+                    cancellationToken);
+            }
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to add {ProblemId} to index for {Type}", problemId, exceptionType);
         }
     }
 
     private static string GetCacheKey(string problemId) => $"analyzed:{problemId}";
+    private static string GetIndexKey(string exceptionType) => $"analyzed:index:{exceptionType}";
 }

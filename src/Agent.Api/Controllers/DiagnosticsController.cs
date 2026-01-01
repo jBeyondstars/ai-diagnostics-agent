@@ -18,13 +18,13 @@ namespace Agent.Api.Controllers;
 [ApiController]
 [Route("api/[controller]")]
 [Produces("application/json")]
-public class DiagnosticsController(
+public partial class DiagnosticsController(
     DiagnosticsAgent agent,
     IOptions<AgentConfiguration> config,
     IDistributedCache cache,
+    DeduplicationService deduplicationService,
     ILogger<DiagnosticsController> logger) : ControllerBase
 {
-    private readonly AgentConfiguration _config = config.Value;
     private static readonly TimeSpan WebhookDebounce = TimeSpan.FromMinutes(5);
     /// <summary>
     /// Run a full exception analysis from Application Insights.
@@ -104,6 +104,46 @@ public class DiagnosticsController(
     }
 
     /// <summary>
+    /// Clear the deduplication cache for a specific exception or all exceptions.
+    /// Use this when a PR was closed without merging and you want to re-analyze.
+    /// </summary>
+    /// <param name="problemId">Optional: specific problemId to clear. If empty, clears all analyzed markers.</param>
+    [HttpDelete("cache/dedup")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<ActionResult> ClearDeduplicationCache(
+        [FromQuery] string? problemId = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (!string.IsNullOrEmpty(problemId))
+        {
+            await deduplicationService.ClearAsync(problemId, cancellationToken);
+            logger.LogInformation("Cleared deduplication cache for: {ProblemId}", problemId);
+            return Ok(new { message = $"Cleared cache for: {problemId}" });
+        }
+
+        // Clear all analyzed:* keys by pattern (requires listing known patterns)
+        // For now, clear common exception types
+        var commonTypes = new[]
+        {
+            "System.NullReferenceException",
+            "System.InvalidOperationException",
+            "System.DivideByZeroException",
+            "System.ArgumentException",
+            "System.FormatException",
+            "System.IndexOutOfRangeException",
+            "System.KeyNotFoundException"
+        };
+
+        foreach (var type in commonTypes)
+        {
+            await cache.RemoveAsync($"analyzed:{type}", cancellationToken);
+        }
+
+        logger.LogInformation("Cleared deduplication cache for common exception types");
+        return Ok(new { message = "Cleared deduplication cache for common exception types" });
+    }
+
+    /// <summary>
     /// Test LLM connectivity.
     /// </summary>
     [HttpGet("test-llm")]
@@ -136,7 +176,7 @@ public class DiagnosticsController(
     [ProducesResponseType<AppInsightsTestResult>(StatusCodes.Status200OK)]
     public async Task<ActionResult<AppInsightsTestResult>> TestAppInsights(CancellationToken cancellationToken)
     {
-        var workspaceId = _config.AppInsights.WorkspaceId;
+        var workspaceId = config.Value.AppInsights.WorkspaceId;
         logger.LogInformation("Testing App Insights connection. WorkspaceId: {WorkspaceId}", workspaceId);
 
         if (string.IsNullOrEmpty(workspaceId))
@@ -160,10 +200,9 @@ public class DiagnosticsController(
                 new QueryTimeRange(TimeSpan.FromHours(24)),
                 cancellationToken: cancellationToken);
 
-            var tables = response.Value.Table.Rows
+            List<string> tables = [.. response.Value.Table.Rows
                 .Select(r => r[0]?.ToString() ?? "")
-                .Where(t => !string.IsNullOrEmpty(t))
-                .ToList();
+                .Where(t => !string.IsNullOrEmpty(t))];
 
             return Ok(new AppInsightsTestResult
             {
@@ -205,7 +244,6 @@ public class DiagnosticsController(
 
         try
         {
-            // Extract alert info from the common alert schema
             string alertId = "unknown";
             string alertRule = "unknown";
             string severity = "Sev3";
@@ -226,7 +264,7 @@ public class DiagnosticsController(
             logger.LogInformation("Alert received: Rule={Rule}, Severity={Severity}, AlertId={AlertId}",
                 alertRule, severity, alertId);
 
-            // Debounce: check if we've processed an alert recently
+            // check if we've processed an alert recently
             var debounceKey = $"webhook:debounce:{alertRule}";
             var lastProcessed = await cache.GetStringAsync(debounceKey, cancellationToken);
 
@@ -242,7 +280,6 @@ public class DiagnosticsController(
                 });
             }
 
-            // Set debounce marker
             await cache.SetStringAsync(
                 debounceKey,
                 DateTimeOffset.UtcNow.ToString("O"),
@@ -258,9 +295,17 @@ public class DiagnosticsController(
                 try
                 {
                     logger.LogInformation("Starting background analysis triggered by alert {Rule}", alertRule);
-                    var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.Latest, CancellationToken.None);
-                    logger.LogInformation("Background analysis completed: {Fixes} fixes, PR={Url}",
-                        report.TotalFixes, report.PullRequestUrl);
+                    var request = new AnalysisRequest
+                    {
+                        HoursToAnalyze = 1,
+                        CreatePullRequest = true,
+                        MinOccurrences = 1,
+                        MaxExceptionsToAnalyze = 10,
+                        LatestOnly = false
+                    };
+                    var report = await agent.AnalyzeAndFixAsync(request, CancellationToken.None);
+                    logger.LogInformation("Background analysis completed: {Fixes} fixes, {PRs} PRs created",
+                        report.TotalFixes, report.TotalPullRequests);
                 }
                 catch (Exception ex)
                 {
@@ -288,27 +333,136 @@ public class DiagnosticsController(
     }
 
     /// <summary>
+    /// GitHub webhook endpoint for PR events.
+    /// Automatically clears the deduplication cache when a PR is closed without merging.
+    /// Configure this URL in your GitHub repo: Settings > Webhooks > Add webhook
+    /// Set Content-Type to application/json and select "Pull requests" events.
+    /// </summary>
+    [HttpPost("webhook/github")]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    public async Task<ActionResult> OnGitHubWebhook(
+        [FromBody] JsonElement payload,
+        [FromHeader(Name = "X-GitHub-Event")] string? eventType,
+        CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Received GitHub webhook: {EventType}", eventType);
+
+        if (eventType != "pull_request")
+        {
+            return Ok(new { message = $"Ignored event type: {eventType}" });
+        }
+
+        try
+        {
+            if (!payload.TryGetProperty("action", out var actionProp))
+            {
+                return Ok(new { message = "No action in payload" });
+            }
+
+            var action = actionProp.GetString();
+
+            if (action != "closed")
+            {
+                logger.LogDebug("Ignoring PR action: {Action}", action);
+                return Ok(new { message = $"Ignored action: {action}" });
+            }
+
+            if (!payload.TryGetProperty("pull_request", out var prProp))
+            {
+                return Ok(new { message = "No pull_request in payload" });
+            }
+
+            var merged = prProp.TryGetProperty("merged", out var mergedProp) && mergedProp.GetBoolean();
+            var prNumber = prProp.TryGetProperty("number", out var numProp) ? numProp.GetInt32() : 0;
+            var prTitle = prProp.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "";
+
+            if (merged)
+            {
+                logger.LogInformation("PR #{Number} was merged - no cache clear needed", prNumber);
+                return Ok(new { message = $"PR #{prNumber} merged - fix applied" });
+            }
+
+            logger.LogInformation("PR #{Number} closed without merge - clearing dedup cache", prNumber);
+
+            var exceptionType = ExtractExceptionTypeFromTitle(prTitle ?? "");
+
+            if (!string.IsNullOrEmpty(exceptionType))
+            {
+                // Clear all cache entries containing this exception type
+                // Since we don't have the exact problemId, clear by pattern
+                await deduplicationService.ClearByPatternAsync(exceptionType, cancellationToken);
+                logger.LogInformation("Cleared cache for exception type: {Type}", exceptionType);
+
+                return Ok(new {
+                    message = $"PR #{prNumber} closed - cache cleared for {exceptionType}",
+                    exceptionType
+                });
+            }
+
+            return Ok(new { message = $"PR #{prNumber} closed - could not extract exception type from title" });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error processing GitHub webhook");
+            return Ok(new { error = ex.Message });
+        }
+    }
+
+    private static string? ExtractExceptionTypeFromTitle(string title)
+    {
+        var match = MyRegex().Match(title);
+
+        if (match.Success)
+        {
+            return "System." + match.Groups[1].Value;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Simple webhook endpoint for testing (no Azure Monitor payload required).
     /// </summary>
+    /// <param name="createPR">Whether to create pull requests for fixes</param>
+    /// <param name="hours">Hours to look back for exceptions (default: 1)</param>
+    /// <param name="maxExceptions">Maximum number of exceptions to analyze (default: 10)</param>
+    /// <param name="latestOnly">If true, only analyze the most recent exception (default: false)</param>
     [HttpPost("webhook/trigger")]
     [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
     public async Task<ActionResult<WebhookResponse>> TriggerAnalysis(
         [FromQuery] bool createPR = true,
+        [FromQuery] int hours = 1,
+        [FromQuery] int maxExceptions = 10,
+        [FromQuery] bool latestOnly = false,
         CancellationToken cancellationToken = default)
     {
-        logger.LogInformation("Manual webhook trigger received, createPR={CreatePR}", createPR);
+        logger.LogInformation(
+            "Manual webhook trigger: createPR={CreatePR}, hours={Hours}, maxExceptions={Max}, latestOnly={LatestOnly}",
+            createPR, hours, maxExceptions, latestOnly);
 
-        var request = AnalysisRequest.Latest with { CreatePullRequest = createPR };
+        var request = new AnalysisRequest
+        {
+            HoursToAnalyze = hours,
+            CreatePullRequest = createPR,
+            MinOccurrences = 1,
+            MaxExceptionsToAnalyze = maxExceptions,
+            LatestOnly = latestOnly
+        };
+
         var report = await agent.AnalyzeAndFixAsync(request, cancellationToken);
 
         return Ok(new WebhookResponse
         {
             Status = "completed",
-            Message = $"Analysis completed: {report.TotalFixes} fixes proposed",
+            Message = $"Analysis completed: {report.TotalFixes} fixes proposed, {report.TotalPullRequests} PRs created",
             PullRequestUrl = report.PullRequestUrl,
+            PullRequestUrls = report.PullRequestUrls,
             TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
         });
     }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"Handle\s+(\w+Exception)", System.Text.RegularExpressions.RegexOptions.IgnoreCase, "fr-FR")]
+    private static partial System.Text.RegularExpressions.Regex MyRegex();
 }
 
 public record WebhookResponse
@@ -319,6 +473,7 @@ public record WebhookResponse
     public string? LastProcessedAt { get; init; }
     public string? TriggeredAt { get; init; }
     public string? PullRequestUrl { get; init; }
+    public List<string>? PullRequestUrls { get; init; }
 }
 
 public record AgentStatus

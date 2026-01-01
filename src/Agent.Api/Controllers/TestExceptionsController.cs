@@ -262,21 +262,20 @@ public class UsersController(ILogger<UsersController> logger) : ControllerBase
     {
         logger.LogInformation("Searching users with query: {Query}", query);
 
-        var results = _users.Values
-            .Where(u => u.Name.Contains(query, StringComparison.OrdinalIgnoreCase))
-            .ToList();
+        List<User> results = [.. _users.Values
+            .Where(u => u.Name.Contains(query, StringComparison.OrdinalIgnoreCase))];
 
         // BUG: Assumes at least one result exists
         var firstResult = results[0];
         logger.LogInformation("First match: {Name}", firstResult.Name);
 
-        return Ok(results.Select(u => new UserDto
+        return Ok((List<UserDto>)[.. results.Select(u => new UserDto
         {
             Id = u.Id,
             Name = u.Name,
             Email = u.Email ?? "N/A",
             PrimaryRole = u.Roles.FirstOrDefault() ?? "none"
-        }).ToList());
+        })]);
     }
 }
 

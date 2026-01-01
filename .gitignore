@@ -128,3 +128,6 @@ npm-debug.log*
 
 # JetBrains
 *.sln.iml
+
+# Local documentation (not versioned)
+docs-local/

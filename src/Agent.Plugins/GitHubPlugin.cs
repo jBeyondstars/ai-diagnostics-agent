@@ -22,9 +22,6 @@ public sealed class GitHubPlugin(
         Credentials = new Credentials(token)
     };
 
-    private readonly string _owner = owner;
-    private readonly string _repo = repo;
-    private readonly string _defaultBranch = defaultBranch;
     private readonly ILogger<GitHubPlugin> _logger = logger
         ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<GitHubPlugin>.Instance;
 
@@ -41,12 +38,12 @@ public sealed class GitHubPlugin(
         [Description("Branch to read from (defaults to main)")]
         string? branch = null)
     {
-        branch ??= _defaultBranch;
+        branch ??= defaultBranch;
         _logger.LogInformation("Getting file content: {FilePath} from branch {Branch}", filePath, branch);
 
         try
         {
-            var contents = await _client.Repository.Content.GetAllContentsByRef(_owner, _repo, filePath, branch);
+            var contents = await _client.Repository.Content.GetAllContentsByRef(owner, repo, filePath, branch);
 
             if (contents.Count > 0)
             {
@@ -79,7 +76,7 @@ public sealed class GitHubPlugin(
                 }
 
                 _logger.LogInformation("Fetching raw content for {FilePath}", filePath);
-                var rawContent = await _client.Repository.Content.GetRawContentByRef(_owner, _repo, filePath, branch);
+                var rawContent = await _client.Repository.Content.GetRawContentByRef(owner, repo, filePath, branch);
                 _logger.LogInformation("Got raw content: {Length} bytes", rawContent.Length);
 
                 return JsonSerializer.Serialize(new
@@ -123,7 +120,7 @@ public sealed class GitHubPlugin(
 
         try
         {
-            var searchQuery = $"{query} repo:{_owner}/{_repo}";
+            var searchQuery = $"{query} repo:{owner}/{repo}";
             if (!string.IsNullOrEmpty(extension))
             {
                 searchQuery += $" extension:{extension}";
@@ -132,12 +129,12 @@ public sealed class GitHubPlugin(
             var request = new SearchCodeRequest(searchQuery) { PerPage = maxResults };
             var results = await _client.Search.SearchCode(request);
 
-            var matches = results.Items.Select(item => new
+            List<object> matches = [.. results.Items.Select(item => new
             {
                 path = item.Path,
                 name = item.Name,
                 url = item.HtmlUrl
-            }).ToList();
+            })];
 
             _logger.LogInformation("Found {Count} matches", matches.Count);
 
@@ -161,7 +158,7 @@ public sealed class GitHubPlugin(
         [Description("Branch to read from (defaults to main)")]
         string? branch = null)
     {
-        branch ??= _defaultBranch;
+        branch ??= defaultBranch;
         var paths = filePaths.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
         _logger.LogInformation("Getting {Count} files from branch {Branch}", paths.Length, branch);
@@ -172,7 +169,7 @@ public sealed class GitHubPlugin(
         {
             try
             {
-                var contents = await _client.Repository.Content.GetAllContentsByRef(_owner, _repo, path, branch);
+                var contents = await _client.Repository.Content.GetAllContentsByRef(owner, repo, path, branch);
 
                 if (contents.Count > 0)
                 {
@@ -180,7 +177,7 @@ public sealed class GitHubPlugin(
                     var content = !string.IsNullOrEmpty(file.Content)
                         ? System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(file.Content))
                         : System.Text.Encoding.UTF8.GetString(
-                            await _client.Repository.Content.GetRawContentByRef(_owner, _repo, path, branch));
+                            await _client.Repository.Content.GetRawContentByRef(owner, repo, path, branch));
 
                     results.Add(new { path, sha = file.Sha, content, success = true });
                 }
@@ -225,8 +222,8 @@ public sealed class GitHubPlugin(
 
             var branchName = $"fix/ai-agent-{DateTime.UtcNow:yyyyMMdd-HHmmss}";
 
-            var mainRef = await _client.Git.Reference.Get(_owner, _repo, $"heads/{_defaultBranch}");
-            await _client.Git.Reference.Create(_owner, _repo, new NewReference(
+            var mainRef = await _client.Git.Reference.Get(owner, repo, $"heads/{defaultBranch}");
+            await _client.Git.Reference.Create(owner, repo, new NewReference(
                 $"refs/heads/{branchName}",
                 mainRef.Object.Sha));
 
@@ -237,12 +234,12 @@ public sealed class GitHubPlugin(
                 try
                 {
                     var existingFiles = await _client.Repository.Content.GetAllContentsByRef(
-                        _owner, _repo, file.Path, branchName);
+                        owner, repo, file.Path, branchName);
 
                     if (existingFiles.Count > 0)
                     {
                         await _client.Repository.Content.UpdateFile(
-                            _owner, _repo, file.Path,
+                            owner, repo, file.Path,
                             new UpdateFileRequest(
                                 $"fix: {Path.GetFileName(file.Path)} - AI Agent auto-fix",
                                 file.Content,
@@ -255,7 +252,7 @@ public sealed class GitHubPlugin(
                 catch (NotFoundException)
                 {
                     await _client.Repository.Content.CreateFile(
-                        _owner, _repo, file.Path,
+                        owner, repo, file.Path,
                         new CreateFileRequest(
                             $"fix: {Path.GetFileName(file.Path)} - AI Agent auto-fix",
                             file.Content,
@@ -281,10 +278,10 @@ public sealed class GitHubPlugin(
                 > exception patterns and stack traces.
                 """;
 
-            var pr = await _client.PullRequest.Create(_owner, _repo, new NewPullRequest(
+            var pr = await _client.PullRequest.Create(owner, repo, new NewPullRequest(
                 title,
                 branchName,
-                _defaultBranch)
+                defaultBranch)
             {
                 Body = prBody
             });
@@ -342,7 +339,7 @@ public sealed class GitHubPlugin(
                 newIssue.Labels.Add(label);
             }
 
-            var issue = await _client.Issue.Create(_owner, _repo, newIssue);
+            var issue = await _client.Issue.Create(owner, repo, newIssue);
 
             _logger.LogInformation("Created Issue #{Number}: {Url}", issue.Number, issue.HtmlUrl);
 
@@ -375,23 +372,23 @@ public sealed class GitHubPlugin(
 
         try
         {
-            var request = new CommitRequest { Sha = _defaultBranch };
+            var request = new CommitRequest { Sha = defaultBranch };
 
             if (!string.IsNullOrEmpty(path))
             {
                 request.Path = path;
             }
 
-            var commits = await _client.Repository.Commit.GetAll(_owner, _repo, request);
+            var commits = await _client.Repository.Commit.GetAll(owner, repo, request);
 
-            var results = commits.Take(count).Select(c => new
+            List<object> results = [.. commits.Take(count).Select(c => new
             {
                 sha = c.Sha[..7],
                 message = c.Commit.Message.Split('\n')[0],
                 author = c.Commit.Author.Name,
                 date = c.Commit.Author.Date.ToString("yyyy-MM-dd HH:mm"),
                 url = c.HtmlUrl
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(results, JsonOptions);
         }
@@ -417,7 +414,7 @@ public sealed class GitHubPlugin(
 
         try
         {
-            var searchQuery = $"{query} repo:{_owner}/{_repo}";
+            var searchQuery = $"{query} repo:{owner}/{repo}";
 
             if (state != "all")
             {
@@ -435,7 +432,7 @@ public sealed class GitHubPlugin(
                 isPullRequest = i.PullRequest is not null,
                 url = i.HtmlUrl,
                 createdAt = i.CreatedAt.ToString("yyyy-MM-dd"),
-                labels = i.Labels.Select(l => l.Name).ToList()
+                labels = (List<string>)[.. i.Labels.Select(l => l.Name)]
             }).ToList();
 
             return JsonSerializer.Serialize(new { totalCount = results.TotalCount, issues }, JsonOptions);
@@ -463,12 +460,12 @@ public sealed class GitHubPlugin(
         {
             // Get all open PRs created by the AI agent
             var prs = await _client.PullRequest.GetAllForRepository(
-                _owner,
-                _repo,
+                owner,
+                repo,
                 new PullRequestRequest { State = ItemStateFilter.Open });
 
             // Filter to AI agent PRs only
-            var agentPrs = prs.Where(pr => pr.Head.Ref.StartsWith("fix/ai-agent-")).ToList();
+            List<PullRequest> agentPrs = [.. prs.Where(pr => pr.Head.Ref.StartsWith("fix/ai-agent-"))];
 
             if (agentPrs.Count == 0)
             {
@@ -534,14 +531,14 @@ public sealed class GitHubPlugin(
         [Description("Head commit/branch to compare to (defaults to default branch)")]
         string? headRef = null)
     {
-        headRef ??= _defaultBranch;
+        headRef ??= defaultBranch;
         _logger.LogInformation("Getting diff between {Base} and {Head}", baseRef, headRef);
 
         try
         {
-            var comparison = await _client.Repository.Commit.Compare(_owner, _repo, baseRef, headRef);
+            var comparison = await _client.Repository.Commit.Compare(owner, repo, baseRef, headRef);
 
-            var files = comparison.Files.Select(f => new
+            List<object> files = [.. comparison.Files.Select(f => new
             {
                 filename = f.Filename,
                 status = f.Status,
@@ -549,7 +546,7 @@ public sealed class GitHubPlugin(
                 deletions = f.Deletions,
                 changes = f.Changes,
                 patch = f.Patch?.Length > 2000 ? f.Patch[..2000] + "\n... (truncated)" : f.Patch
-            }).ToList();
+            })];
 
             return JsonSerializer.Serialize(new
             {

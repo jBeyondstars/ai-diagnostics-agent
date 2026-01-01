@@ -30,7 +30,7 @@ public sealed class DatadogLogProvider(
         }
     };
 
-    private readonly ILogger<DatadogLogProvider> _logger = logger
+    private readonly ILogger _logger = logger
         ?? Microsoft.Extensions.Logging.Abstractions.NullLogger<DatadogLogProvider>.Instance;
 
     public string ProviderName => "Datadog";

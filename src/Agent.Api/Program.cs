@@ -2,7 +2,7 @@ using Agent.Api.Middleware;
 using Agent.Core;
 using Agent.Core.Configuration;
 using Agent.Core.Services;
-using Scalar.AspNetCore;
+using Microsoft.AspNetCore.HttpOverrides;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -56,10 +56,17 @@ builder.Services.AddOpenApi(options =>
     });
 });
 
-// Add ProblemDetails for consistent error responses
 builder.Services.AddProblemDetails();
 
-// CORS for Scalar UI
+// Configure forwarded headers for Azure Container Apps reverse proxy
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.KnownNetworks.Clear();
+    options.KnownProxies.Clear();
+});
+
+// CORS for Swagger UI
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
@@ -72,30 +79,30 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
+// Handle forwarded headers from Azure Container Apps reverse proxy (configured in services)
+app.UseForwardedHeaders();
+
 app.UseGlobalExceptionHandler();
 
 app.UseCors();
 
-// Temporarily disabled due to .NET 10 preview compatibility issues
-// app.MapOpenApi();
-// app.MapScalarApiReference(options =>
-// {
-//     options.Title = "AI Diagnostics Agent";
-//     options.Theme = ScalarTheme.BluePlanet;
-//     options.DefaultHttpClient = new(ScalarTarget.CSharp, ScalarClient.HttpClient);
-//     options.ProxyUrl = null;
-// });
+app.MapOpenApi().RequireCors();
+app.UseSwaggerUI(options =>
+{
+    options.SwaggerEndpoint("/openapi/v1.json", "AI Diagnostics Agent API v1");
+    options.RoutePrefix = "swagger";
+    options.DocumentTitle = "AI Diagnostics Agent";
+});
 
 app.MapDefaultEndpoints();
 
 app.MapControllers();
 
-// Redirect root to API docs (Scalar disabled due to .NET 10 compatibility)
 app.Use(async (context, next) =>
 {
     if (context.Request.Path == "/")
     {
-        context.Response.Redirect("/api/diagnostics/status");
+        context.Response.Redirect("/swagger");
         return;
     }
     await next();

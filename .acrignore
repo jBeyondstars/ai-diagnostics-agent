@@ -10,6 +10,3 @@ obj/
 *.md
 infra/
 tests/
-.vs
-bin
-obj

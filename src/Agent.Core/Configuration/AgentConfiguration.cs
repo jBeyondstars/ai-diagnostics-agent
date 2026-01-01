@@ -72,6 +72,19 @@ public sealed class ExceptionFilterConfiguration
     /// If true, ask Claude to evaluate if ambiguous exceptions are fixable.
     /// </summary>
     public bool EnableClaudeEvaluation { get; set; } = true;
+
+    /// <summary>
+    /// Exception types that typically indicate input validation errors (client sent bad data).
+    /// These will be evaluated by Claude to determine if they're real bugs or expected validation.
+    /// </summary>
+    public string[] InputValidationExceptionTypes { get; set; } =
+    [
+        "System.FormatException",
+        "System.ArgumentException",
+        "System.ArgumentNullException",
+        "System.ArgumentOutOfRangeException",
+        "System.InvalidCastException"
+    ];
 }
 
 /// <summary>
@@ -133,6 +146,21 @@ public sealed class AppInsightsConfiguration
 
     public bool UseManagedIdentity { get; set; } = true;
     public string? ConnectionString { get; set; }
+
+    /// <summary>
+    /// App Insights resource name (for portal deep links)
+    /// </summary>
+    public string ResourceName { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Resource group containing App Insights
+    /// </summary>
+    public string ResourceGroup { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Azure subscription ID
+    /// </summary>
+    public string SubscriptionId { get; set; } = string.Empty;
 }
 
 /// <summary>

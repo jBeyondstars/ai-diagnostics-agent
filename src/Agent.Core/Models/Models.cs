@@ -18,6 +18,16 @@ public sealed record ExceptionInfo
     public string? SourceFile { get; init; }
     public int? LineNumber { get; init; }
 
+    /// <summary>
+    /// App Insights item ID for deep linking
+    /// </summary>
+    public string? ItemId { get; init; }
+
+    /// <summary>
+    /// Exception timestamp for App Insights URL
+    /// </summary>
+    public string? ItemTimestamp { get; init; }
+
     public string Severity => OccurrenceCount switch
     {
         > 100 => "Critical",
@@ -54,12 +64,22 @@ public sealed record DiagnosticReport
     public required List<CodeFix> ProposedFixes { get; init; }
     public required string Summary { get; init; }
 
+    /// <summary>
+    /// URL of the PR (for single PR scenarios, backwards compatibility)
+    /// </summary>
     public string? PullRequestUrl { get; init; }
+
+    /// <summary>
+    /// All PR URLs created (one per exception)
+    /// </summary>
+    public List<string> PullRequestUrls { get; init; } = [];
+
     public string? IssueUrl { get; init; }
     public decimal? EstimatedCost { get; init; }
 
     public int TotalExceptions => Exceptions.Count;
     public int TotalFixes => ProposedFixes.Count;
+    public int TotalPullRequests => PullRequestUrls.Count;
     public int CriticalExceptions => Exceptions.Count(e => e.Severity is "Critical");
 }
 
