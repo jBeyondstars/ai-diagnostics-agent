@@ -227,7 +227,7 @@ public sealed class AnthropicChatCompletionService(
         [
             new ChatMessageContent(AuthorRole.Assistant, ExtractTextContent(followUpResponse))
             {
-                ModelId = _modelId
+                ModelId = modelId
             }
         ];
     }
