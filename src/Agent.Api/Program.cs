@@ -76,20 +76,29 @@ app.UseGlobalExceptionHandler();
 
 app.UseCors();
 
-app.MapOpenApi();
-app.MapScalarApiReference(options =>
-{
-    options.Title = "AI Diagnostics Agent";
-    options.Theme = ScalarTheme.BluePlanet;
-    options.DefaultHttpClient = new(ScalarTarget.CSharp, ScalarClient.HttpClient);
-    options.ProxyUrl = null;
-});
+// Temporarily disabled due to .NET 10 preview compatibility issues
+// app.MapOpenApi();
+// app.MapScalarApiReference(options =>
+// {
+//     options.Title = "AI Diagnostics Agent";
+//     options.Theme = ScalarTheme.BluePlanet;
+//     options.DefaultHttpClient = new(ScalarTarget.CSharp, ScalarClient.HttpClient);
+//     options.ProxyUrl = null;
+// });
 
 app.MapDefaultEndpoints();
 
 app.MapControllers();
 
-app.MapGet("/", () => Results.Redirect("/scalar/v1"))
-    .ExcludeFromDescription();
+// Redirect root to API docs (Scalar disabled due to .NET 10 compatibility)
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path == "/")
+    {
+        context.Response.Redirect("/api/diagnostics/status");
+        return;
+    }
+    await next();
+});
 
 app.Run();
