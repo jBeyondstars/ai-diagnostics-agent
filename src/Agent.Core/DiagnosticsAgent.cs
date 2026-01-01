@@ -19,10 +19,12 @@ namespace Agent.Core;
 /// </summary>
 public sealed class DiagnosticsAgent(
     IOptions<AgentConfiguration> config,
-    ILogger<DiagnosticsAgent> logger) : IDisposable
+    ILogger<DiagnosticsAgent> logger,
+    DeduplicationService? deduplicationService = null) : IDisposable
 {
     private readonly AgentConfiguration _config = config.Value;
     private readonly Kernel _kernel = CreateKernel(config.Value, logger);
+    private readonly DeduplicationService? _deduplicationService = deduplicationService;
     private ChatCompletionAgent? _agent;
     private bool _disposed;
 
@@ -200,6 +202,94 @@ public sealed class DiagnosticsAgent(
                 Exceptions = [],
                 ProposedFixes = []
             };
+        }
+
+        // Filter out non-actionable exceptions (infrastructure/transient errors)
+        var exceptionFilter = _config.ExceptionFilter;
+        var actionableExceptions = new List<ExceptionInfo>();
+
+        foreach (var ex in exceptions)
+        {
+            var filterResult = IsNonActionableException(ex, exceptionFilter);
+
+            if (filterResult.IsFiltered)
+            {
+                logger.LogInformation("Skipping non-actionable exception {Type}: {Reason}",
+                    ex.ExceptionType, filterResult.Reason);
+                continue;
+            }
+
+            // For ambiguous exceptions, optionally ask Claude to evaluate
+            if (filterResult.IsAmbiguous && exceptionFilter.EnableClaudeEvaluation)
+            {
+                var isFixable = await EvaluateIfFixableAsync(ex, cancellationToken);
+                if (!isFixable)
+                {
+                    logger.LogInformation("Claude determined {Type} is not fixable by code changes",
+                        ex.ExceptionType);
+                    continue;
+                }
+                logger.LogInformation("Claude determined {Type} IS fixable by code changes",
+                    ex.ExceptionType);
+            }
+
+            actionableExceptions.Add(ex);
+        }
+
+        if (actionableExceptions.Count == 0)
+        {
+            logger.LogInformation("All {Count} exceptions were filtered as non-actionable", exceptions.Count);
+            return new DiagnosticReport
+            {
+                GeneratedAt = DateTimeOffset.UtcNow,
+                AnalysisPeriod = TimeSpan.FromHours(request.HoursToAnalyze),
+                Summary = $"Found {exceptions.Count} exceptions but all were infrastructure/transient errors with no code fix available.",
+                Exceptions = exceptions,
+                ProposedFixes = []
+            };
+        }
+
+        logger.LogInformation("After filtering: {Actionable}/{Total} actionable exceptions",
+            actionableExceptions.Count, exceptions.Count);
+        exceptions = actionableExceptions;
+
+        // Filter out exceptions that were recently analyzed (Redis deduplication)
+        if (_deduplicationService != null)
+        {
+            var filteredExceptions = new List<ExceptionInfo>();
+            foreach (var ex in exceptions)
+            {
+                var shouldAnalyze = await _deduplicationService.ShouldAnalyzeAsync(
+                    ex.ProblemId ?? ex.ExceptionType,
+                    cancellationToken);
+
+                if (shouldAnalyze)
+                {
+                    filteredExceptions.Add(ex);
+                }
+                else
+                {
+                    logger.LogInformation("Skipping {Type} (problemId: {ProblemId}) - recently analyzed",
+                        ex.ExceptionType, ex.ProblemId);
+                }
+            }
+
+            if (filteredExceptions.Count == 0)
+            {
+                logger.LogInformation("All exceptions were recently analyzed, nothing new to process");
+                return new DiagnosticReport
+                {
+                    GeneratedAt = DateTimeOffset.UtcNow,
+                    AnalysisPeriod = TimeSpan.FromHours(request.HoursToAnalyze),
+                    Summary = "All exceptions were recently analyzed. No new issues to process.",
+                    Exceptions = exceptions,
+                    ProposedFixes = []
+                };
+            }
+
+            logger.LogInformation("After deduplication: {New}/{Total} exceptions to analyze",
+                filteredExceptions.Count, exceptions.Count);
+            exceptions = filteredExceptions;
         }
 
         // 1b. Extract source file paths from stack traces
@@ -440,6 +530,34 @@ public sealed class DiagnosticsAgent(
         var fixes = report.ProposedFixes;
         var exceptions = report.Exceptions;
 
+        // Check if there's already an open PR for this specific exception
+        // Uses hybrid check: ProblemId + source file + exception type
+        if (exceptions.Count > 0)
+        {
+            var mainException = exceptions[0];
+            var existingPr = await _gitHubPlugin.CheckExistingPrAsync(
+                mainException.ExceptionType,
+                mainException.ProblemId,
+                mainException.SourceFile);
+
+            if (existingPr.Exists)
+            {
+                logger.LogInformation("PR already exists for {ExceptionType} in {SourceFile}: {Url}",
+                    mainException.ExceptionType, mainException.SourceFile, existingPr.PrUrl);
+
+                // Mark as analyzed to prevent re-analysis
+                if (_deduplicationService != null)
+                {
+                    await _deduplicationService.MarkAsAnalyzedAsync(
+                        mainException.ProblemId ?? mainException.ExceptionType,
+                        TimeSpan.FromHours(24),
+                        cancellationToken);
+                }
+
+                return existingPr.PrUrl;
+            }
+        }
+
         var fileChanges = new List<object>();
         var fixesByFile = fixes.GroupBy(f => f.FilePath);
 
@@ -581,6 +699,14 @@ public sealed class DiagnosticsAgent(
         foreach (var ex in exceptions.Take(5))
         {
             descBuilder.AppendLine($"- `{ex.ExceptionType}` ({ex.OccurrenceCount} occurrences)");
+            if (!string.IsNullOrEmpty(ex.SourceFile))
+            {
+                descBuilder.AppendLine($"  - Source: `{ex.SourceFile}`");
+            }
+            if (!string.IsNullOrEmpty(ex.ProblemId))
+            {
+                descBuilder.AppendLine($"  - ProblemId: `{ex.ProblemId}`");
+            }
         }
         descBuilder.AppendLine();
         descBuilder.AppendLine("---");
@@ -594,16 +720,20 @@ public sealed class DiagnosticsAgent(
             var result = await _gitHubPlugin.CreatePullRequestAsync(title, descBuilder.ToString(), filesJson);
             logger.LogInformation("GitHub CreatePR response: {Response}", result?.Length > 500 ? result[..500] + "..." : result);
 
+            string? prUrl = null;
+
             try
             {
                 using var doc = JsonDocument.Parse(result);
-                if (doc.RootElement.TryGetProperty("html_url", out var urlProp))
+                if (doc.RootElement.TryGetProperty("pullRequestUrl", out var urlProp))
                 {
-                    var url = urlProp.GetString();
-                    logger.LogInformation("PR created successfully: {Url}", url);
-                    return url;
+                    prUrl = urlProp.GetString();
                 }
-                if (doc.RootElement.TryGetProperty("error", out var errorProp))
+                else if (doc.RootElement.TryGetProperty("html_url", out var htmlUrlProp))
+                {
+                    prUrl = htmlUrlProp.GetString();
+                }
+                else if (doc.RootElement.TryGetProperty("error", out var errorProp))
                 {
                     logger.LogWarning("GitHub returned error: {Error}", errorProp.GetString());
                 }
@@ -613,15 +743,38 @@ public sealed class DiagnosticsAgent(
                 logger.LogWarning(ex, "Failed to parse GitHub response as JSON");
             }
 
-            var urlMatch = System.Text.RegularExpressions.Regex.Match(result, @"https://github\.com/[^\s""]+/pull/\d+");
-            if (urlMatch.Success)
+            // Try regex if JSON parsing didn't find URL
+            if (string.IsNullOrEmpty(prUrl))
             {
-                logger.LogInformation("Found PR URL via regex: {Url}", urlMatch.Value);
-                return urlMatch.Value;
+                var urlMatch = System.Text.RegularExpressions.Regex.Match(result ?? "", @"https://github\.com/[^\s""]+/pull/\d+");
+                if (urlMatch.Success)
+                {
+                    prUrl = urlMatch.Value;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(prUrl))
+            {
+                logger.LogInformation("PR created successfully: {Url}", prUrl);
+
+                // Mark all exceptions as analyzed after successful PR creation
+                if (_deduplicationService != null)
+                {
+                    foreach (var ex in exceptions)
+                    {
+                        await _deduplicationService.MarkAsAnalyzedAsync(
+                            ex.ProblemId ?? ex.ExceptionType,
+                            TimeSpan.FromHours(6),
+                            cancellationToken);
+                    }
+                    logger.LogInformation("Marked {Count} exceptions as analyzed in Redis", exceptions.Count);
+                }
+
+                return prUrl;
             }
 
             logger.LogWarning("Could not extract PR URL from response");
-            return result.Contains("error") ? null : result;
+            return result?.Contains("error") == true ? null : result;
         }
         catch (Exception ex)
         {
@@ -862,6 +1015,101 @@ public sealed class DiagnosticsAgent(
         string? Explanation,
         string? Severity,
         string? Confidence);
+
+    #endregion
+
+    #region Exception Filtering
+
+    /// <summary>
+    /// Result of exception filtering check
+    /// </summary>
+    private readonly record struct ExceptionFilterResult(bool IsFiltered, bool IsAmbiguous, string? Reason);
+
+    /// <summary>
+    /// Checks if an exception is non-actionable (infrastructure/transient error with no code fix).
+    /// </summary>
+    private static ExceptionFilterResult IsNonActionableException(ExceptionInfo exception, ExceptionFilterConfiguration filter)
+    {
+        var exceptionType = exception.ExceptionType;
+        var message = exception.Message ?? "";
+
+        // Level 1: Check exact type matches
+        if (filter.ExcludedTypes.Any(t => exceptionType.Equals(t, StringComparison.OrdinalIgnoreCase)))
+        {
+            return new ExceptionFilterResult(IsFiltered: true, IsAmbiguous: false, Reason: "Excluded exception type");
+        }
+
+        // Level 2: Check pattern matches (partial string match)
+        var matchedPattern = filter.ExcludedPatterns.FirstOrDefault(p =>
+            exceptionType.Contains(p, StringComparison.OrdinalIgnoreCase) ||
+            message.Contains(p, StringComparison.OrdinalIgnoreCase));
+
+        if (matchedPattern != null)
+        {
+            return new ExceptionFilterResult(IsFiltered: true, IsAmbiguous: false, Reason: $"Matched pattern: {matchedPattern}");
+        }
+
+        // Check for ambiguous cases that might need Claude evaluation
+        var ambiguousIndicators = new[]
+        {
+            "external", "api", "service", "endpoint", "remote", "connection",
+            "authentication", "authorization", "401", "403", "500", "502", "503", "504"
+        };
+
+        var isAmbiguous = ambiguousIndicators.Any(indicator =>
+            exceptionType.Contains(indicator, StringComparison.OrdinalIgnoreCase) ||
+            message.Contains(indicator, StringComparison.OrdinalIgnoreCase));
+
+        return new ExceptionFilterResult(IsFiltered: false, IsAmbiguous: isAmbiguous, Reason: null);
+    }
+
+    /// <summary>
+    /// Asks Claude to evaluate if an ambiguous exception is fixable by code changes.
+    /// </summary>
+    private async Task<bool> EvaluateIfFixableAsync(ExceptionInfo exception, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var chatService = _kernel.GetRequiredService<IChatCompletionService>();
+            var chatHistory = new ChatHistory();
+
+            var prompt = $"""
+                You are evaluating if a production exception can be fixed by changing the application code.
+
+                Exception Type: {exception.ExceptionType}
+                Message: {exception.Message}
+                Stack Trace (first 500 chars): {exception.StackTrace?.Take(500).ToString() ?? "N/A"}
+                Operation: {exception.OperationName}
+
+                Question: Can this exception be prevented or handled better by modifying the application code?
+
+                Consider:
+                - If this is a transient infrastructure error (network timeout, service unavailable), the answer is usually NO
+                - If the code is missing proper error handling, retry logic, or input validation, the answer is YES
+                - If the exception reveals a bug in the business logic, the answer is YES
+                - If the exception is caused by external systems being down, the answer is usually NO
+
+                Respond with ONLY one word: YES or NO
+                """;
+
+            chatHistory.AddUserMessage(prompt);
+
+            var response = await chatService.GetChatMessageContentsAsync(
+                chatHistory,
+                kernel: null,
+                cancellationToken: cancellationToken);
+
+            var answer = string.Join("", response.Select(r => r.Content)).Trim().ToUpperInvariant();
+            logger.LogDebug("Claude evaluation for {Type}: {Answer}", exception.ExceptionType, answer);
+
+            return answer.Contains("YES");
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Failed to evaluate exception fixability, defaulting to true");
+            return true; // Default to analyzing if Claude evaluation fails
+        }
+    }
 
     #endregion
 

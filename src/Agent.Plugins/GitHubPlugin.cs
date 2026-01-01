@@ -448,6 +448,82 @@ public sealed class GitHubPlugin(
     }
 
     /// <summary>
+    /// Checks if there's an existing open PR for a specific exception.
+    /// Uses a hybrid approach: checks by ProblemId, then by source file + exception type.
+    /// </summary>
+    public async Task<ExistingPrResult> CheckExistingPrAsync(
+        string exceptionType,
+        string? problemId = null,
+        string? sourceFile = null)
+    {
+        _logger.LogInformation("Checking for existing PR: Type={ExceptionType}, ProblemId={ProblemId}, File={SourceFile}",
+            exceptionType, problemId ?? "null", sourceFile ?? "null");
+
+        try
+        {
+            // Get all open PRs created by the AI agent
+            var prs = await _client.PullRequest.GetAllForRepository(
+                _owner,
+                _repo,
+                new PullRequestRequest { State = ItemStateFilter.Open });
+
+            // Filter to AI agent PRs only
+            var agentPrs = prs.Where(pr => pr.Head.Ref.StartsWith("fix/ai-agent-")).ToList();
+
+            if (agentPrs.Count == 0)
+            {
+                _logger.LogInformation("No AI agent PRs found");
+                return new ExistingPrResult(Exists: false, PrNumber: null, PrUrl: null, PrTitle: null);
+            }
+
+            var shortType = exceptionType.Split('.').Last();
+
+            // Strategy 1: Check by exact ProblemId
+            if (!string.IsNullOrEmpty(problemId))
+            {
+                var prByProblemId = agentPrs.FirstOrDefault(pr =>
+                    pr.Body?.Contains($"ProblemId: `{problemId}`", StringComparison.OrdinalIgnoreCase) == true);
+
+                if (prByProblemId != null)
+                {
+                    _logger.LogInformation("Found existing PR #{Number} by ProblemId: {Url}",
+                        prByProblemId.Number, prByProblemId.HtmlUrl);
+                    return new ExistingPrResult(true, prByProblemId.Number, prByProblemId.HtmlUrl, prByProblemId.Title);
+                }
+            }
+
+            // Strategy 2: Check by source file + exception type (covers old PRs without ProblemId)
+            if (!string.IsNullOrEmpty(sourceFile))
+            {
+                var fileName = Path.GetFileName(sourceFile);
+                var prByFileAndType = agentPrs.FirstOrDefault(pr =>
+                    pr.Body != null &&
+                    pr.Body.Contains(fileName, StringComparison.OrdinalIgnoreCase) &&
+                    (pr.Title.Contains(shortType, StringComparison.OrdinalIgnoreCase) ||
+                     pr.Body.Contains(exceptionType, StringComparison.OrdinalIgnoreCase)));
+
+                if (prByFileAndType != null)
+                {
+                    _logger.LogInformation("Found existing PR #{Number} by file+type ({File} + {Type}): {Url}",
+                        prByFileAndType.Number, fileName, shortType, prByFileAndType.HtmlUrl);
+                    return new ExistingPrResult(true, prByFileAndType.Number, prByFileAndType.HtmlUrl, prByFileAndType.Title);
+                }
+            }
+
+            _logger.LogInformation("No existing PR found for {ExceptionType} in {SourceFile}",
+                exceptionType, sourceFile ?? "unknown");
+            return new ExistingPrResult(Exists: false, PrNumber: null, PrUrl: null, PrTitle: null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error checking for existing PR, allowing creation");
+            return new ExistingPrResult(Exists: false, PrNumber: null, PrUrl: null, PrTitle: null);
+        }
+    }
+
+    public record ExistingPrResult(bool Exists, int? PrNumber, string? PrUrl, string? PrTitle);
+
+    /// <summary>
     /// Gets the diff between two commits or branches
     /// </summary>
     [KernelFunction("get_diff")]

@@ -12,7 +12,7 @@ using OpenTelemetry.Trace;
 namespace Microsoft.Extensions.Hosting;
 
 /// <summary>
-/// Adds common .NET Aspire services: service discovery, resilience, health checks, and OpenTelemetry.
+/// Adds common services: health checks and OpenTelemetry for Application Insights.
 /// </summary>
 public static class Extensions
 {
@@ -20,12 +20,6 @@ public static class Extensions
     {
         builder.ConfigureOpenTelemetry();
         builder.AddDefaultHealthChecks();
-        builder.Services.AddServiceDiscovery();
-        builder.Services.ConfigureHttpClientDefaults(http =>
-        {
-            http.AddStandardResilienceHandler();
-            http.AddServiceDiscovery();
-        });
 
         return builder;
     }

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "alertRuleName": {
+      "value": "ai-agent-exception-alert"
+    },
+    "appInsightsId": {
+      "value": "/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/microsoft.insights/components/<APP_INSIGHTS_NAME>"
+    },
+    "workspaceId": {
+      "value": "<LOG_ANALYTICS_WORKSPACE_ID>"
+    },
+    "webhookUrl": {
+      "value": "https://<YOUR_AGENT_URL>/api/diagnostics/webhook/alert"
+    },
+    "exceptionThreshold": {
+      "value": 1
+    },
+    "evaluationFrequencyMinutes": {
+      "value": 5
+    },
+    "windowSizeMinutes": {
+      "value": 5
+    }
+  }
+}

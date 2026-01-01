@@ -13,6 +13,65 @@ public sealed class AgentConfiguration
     public AppInsightsConfiguration AppInsights { get; set; } = new();
     public GitHubConfiguration GitHub { get; set; } = new();
     public ScheduleConfiguration Schedule { get; set; } = new();
+    public ExceptionFilterConfiguration ExceptionFilter { get; set; } = new();
+}
+
+/// <summary>
+/// Configuration for filtering non-actionable exceptions.
+/// </summary>
+public sealed class ExceptionFilterConfiguration
+{
+    /// <summary>
+    /// Exception types to always ignore (infrastructure/transient errors).
+    /// These exceptions typically don't have code fixes.
+    /// </summary>
+    public string[] ExcludedTypes { get; set; } =
+    [
+        // Network/HTTP errors
+        "System.Net.Http.HttpRequestException",
+        "System.Net.Sockets.SocketException",
+        "System.Net.WebException",
+
+        // Timeout errors
+        "System.TimeoutException",
+        "System.Threading.Tasks.TaskCanceledException",
+        "System.OperationCanceledException",
+
+        // Database connection errors
+        "Microsoft.Data.SqlClient.SqlException",
+        "Npgsql.NpgsqlException",
+        "MySqlConnector.MySqlException",
+
+        // Redis/Cache errors
+        "StackExchange.Redis.RedisConnectionException",
+        "StackExchange.Redis.RedisTimeoutException",
+
+        // Azure SDK transient errors
+        "Azure.RequestFailedException",
+        "Azure.Identity.CredentialUnavailableException",
+
+        // Message queue errors
+        "RabbitMQ.Client.Exceptions.BrokerUnreachableException",
+        "Azure.Messaging.ServiceBus.ServiceBusException"
+    ];
+
+    /// <summary>
+    /// Partial matches to exclude (e.g., "Connection" matches "SqlConnectionException").
+    /// </summary>
+    public string[] ExcludedPatterns { get; set; } =
+    [
+        "ConnectionException",
+        "ConnectionRefused",
+        "HostNotFound",
+        "Unreachable",
+        "Timeout",
+        "NetworkError"
+    ];
+
+    /// <summary>
+    /// If true, ask Claude to evaluate if ambiguous exceptions are fixable.
+    /// </summary>
+    public bool EnableClaudeEvaluation { get; set; } = true;
 }
 
 /// <summary>

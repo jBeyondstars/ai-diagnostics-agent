@@ -1,10 +1,13 @@
 using Agent.Core;
 using Agent.Core.Configuration;
 using Agent.Core.Models;
+using Agent.Core.Services;
 using Azure.Identity;
 using Azure.Monitor.Query;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Options;
+using System.Text.Json;
 
 namespace Agent.Api.Controllers;
 
@@ -18,9 +21,11 @@ namespace Agent.Api.Controllers;
 public class DiagnosticsController(
     DiagnosticsAgent agent,
     IOptions<AgentConfiguration> config,
+    IDistributedCache cache,
     ILogger<DiagnosticsController> logger) : ControllerBase
 {
     private readonly AgentConfiguration _config = config.Value;
+    private static readonly TimeSpan WebhookDebounce = TimeSpan.FromMinutes(5);
     /// <summary>
     /// Run a full exception analysis from Application Insights.
     /// </summary>
@@ -180,6 +185,140 @@ public class DiagnosticsController(
             });
         }
     }
+
+    /// <summary>
+    /// Webhook endpoint for Azure Monitor alerts.
+    /// Configure this URL in your Azure Monitor Action Group.
+    /// </summary>
+    /// <remarks>
+    /// This endpoint receives alerts from Azure Monitor when exceptions are detected.
+    /// It includes debouncing to prevent multiple analyses within a short time window.
+    /// </remarks>
+    [HttpPost("webhook/alert")]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<WebhookResponse>> OnAlertWebhook(
+        [FromBody] JsonElement alertPayload,
+        CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Received Azure Monitor alert webhook");
+
+        try
+        {
+            // Extract alert info from the common alert schema
+            string alertId = "unknown";
+            string alertRule = "unknown";
+            string severity = "Sev3";
+
+            if (alertPayload.TryGetProperty("data", out var data) &&
+                data.TryGetProperty("essentials", out var essentials))
+            {
+                if (essentials.TryGetProperty("alertId", out var alertIdProp))
+                    alertId = alertIdProp.GetString() ?? "unknown";
+
+                if (essentials.TryGetProperty("alertRule", out var ruleProp))
+                    alertRule = ruleProp.GetString() ?? "unknown";
+
+                if (essentials.TryGetProperty("severity", out var sevProp))
+                    severity = sevProp.GetString() ?? "Sev3";
+            }
+
+            logger.LogInformation("Alert received: Rule={Rule}, Severity={Severity}, AlertId={AlertId}",
+                alertRule, severity, alertId);
+
+            // Debounce: check if we've processed an alert recently
+            var debounceKey = $"webhook:debounce:{alertRule}";
+            var lastProcessed = await cache.GetStringAsync(debounceKey, cancellationToken);
+
+            if (lastProcessed != null)
+            {
+                logger.LogInformation("Debouncing alert {Rule} - last processed at {Time}", alertRule, lastProcessed);
+                return StatusCode(429, new WebhookResponse
+                {
+                    Status = "debounced",
+                    Message = $"Alert was recently processed. Next analysis allowed after debounce period.",
+                    AlertRule = alertRule,
+                    LastProcessedAt = lastProcessed
+                });
+            }
+
+            // Set debounce marker
+            await cache.SetStringAsync(
+                debounceKey,
+                DateTimeOffset.UtcNow.ToString("O"),
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = WebhookDebounce
+                },
+                cancellationToken);
+
+            // Run analysis in the background to respond quickly to Azure
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    logger.LogInformation("Starting background analysis triggered by alert {Rule}", alertRule);
+                    var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.Latest, CancellationToken.None);
+                    logger.LogInformation("Background analysis completed: {Fixes} fixes, PR={Url}",
+                        report.TotalFixes, report.PullRequestUrl);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Background analysis failed for alert {Rule}", alertRule);
+                }
+            }, cancellationToken);
+
+            return Ok(new WebhookResponse
+            {
+                Status = "accepted",
+                Message = "Alert received. Analysis started in background.",
+                AlertRule = alertRule,
+                TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error processing alert webhook");
+            return Ok(new WebhookResponse
+            {
+                Status = "error",
+                Message = ex.Message
+            });
+        }
+    }
+
+    /// <summary>
+    /// Simple webhook endpoint for testing (no Azure Monitor payload required).
+    /// </summary>
+    [HttpPost("webhook/trigger")]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
+    public async Task<ActionResult<WebhookResponse>> TriggerAnalysis(
+        [FromQuery] bool createPR = true,
+        CancellationToken cancellationToken = default)
+    {
+        logger.LogInformation("Manual webhook trigger received, createPR={CreatePR}", createPR);
+
+        var request = AnalysisRequest.Latest with { CreatePullRequest = createPR };
+        var report = await agent.AnalyzeAndFixAsync(request, cancellationToken);
+
+        return Ok(new WebhookResponse
+        {
+            Status = "completed",
+            Message = $"Analysis completed: {report.TotalFixes} fixes proposed",
+            PullRequestUrl = report.PullRequestUrl,
+            TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
+        });
+    }
+}
+
+public record WebhookResponse
+{
+    public required string Status { get; init; }
+    public string? Message { get; init; }
+    public string? AlertRule { get; init; }
+    public string? LastProcessedAt { get; init; }
+    public string? TriggeredAt { get; init; }
+    public string? PullRequestUrl { get; init; }
 }
 
 public record AgentStatus
