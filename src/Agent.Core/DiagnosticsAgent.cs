@@ -681,9 +681,52 @@ public sealed class DiagnosticsAgent(
             return null;
         }
 
-        var title = exceptions.Count == 1
-            ? $"fix: Handle {exceptions[0].ExceptionType.Split('.').Last()}"
-            : $"fix: Address {exceptions.Count} production exceptions";
+        var title = GeneratePrTitle(exceptions);
+
+        static string GeneratePrTitle(List<ExceptionInfo> exceptions)
+        {
+            if (exceptions.Count != 1)
+            {
+                return $"fix: Address {exceptions.Count} production exceptions";
+            }
+
+            var ex = exceptions[0];
+            var exceptionName = ex.ExceptionType.Split('.').Last();
+
+            var controllerName = "";
+            if (!string.IsNullOrEmpty(ex.SourceFile))
+            {
+                var fileName = Path.GetFileNameWithoutExtension(ex.SourceFile);
+                if (fileName.EndsWith("Controller", StringComparison.OrdinalIgnoreCase))
+                {
+                    controllerName = fileName;
+                }
+            }
+
+            var endpoint = "";
+            if (!string.IsNullOrEmpty(ex.OperationName))
+            {
+                // Truncate long endpoints
+                endpoint = ex.OperationName.Length > 50
+                    ? ex.OperationName[..47] + "..."
+                    : ex.OperationName;
+            }
+
+            if (!string.IsNullOrEmpty(controllerName) && !string.IsNullOrEmpty(endpoint))
+            {
+                return $"fix({controllerName}): {exceptionName} in {endpoint}";
+            }
+            else if (!string.IsNullOrEmpty(controllerName))
+            {
+                return $"fix({controllerName}): Handle {exceptionName}";
+            }
+            else if (!string.IsNullOrEmpty(endpoint))
+            {
+                return $"fix: {exceptionName} in {endpoint}";
+            }
+
+            return $"fix: Handle {exceptionName}";
+        }
 
         var descBuilder = new System.Text.StringBuilder();
         descBuilder.AppendLine("## Summary");
