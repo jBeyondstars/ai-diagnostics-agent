@@ -10,14 +10,27 @@ param appInsightsId string
 @description('Log Analytics Workspace resource ID')
 param logAnalyticsId string = ''
 
-@description('Webhook URL for the AI Diagnostics Agent')
-param webhookUrl string
+@description('Base URL of the AI Diagnostics Agent (e.g., https://myapp.azurecontainerapps.io)')
+param agentBaseUrl string
+
+@description('Analysis mode: "standard" (fast, no tools) or "hybrid" (Claude can use tools if needed)')
+@allowed([
+  'standard'
+  'hybrid'
+])
+param analysisMode string = 'standard'
 
 @description('Minimum number of exceptions to trigger alert')
 param exceptionThreshold int = 1
 
 @description('Location for the resources')
 param location string = resourceGroup().location
+
+// Construct webhook URL based on analysis mode
+var webhookEndpoint = analysisMode == 'hybrid'
+  ? '/api/diagnostics/webhook/alert-hybrid'
+  : '/api/diagnostics/webhook/alert'
+var webhookUrl = '${agentBaseUrl}${webhookEndpoint}'
 
 // Action Group with Webhook
 resource actionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
@@ -76,3 +89,5 @@ resource alertRule 'Microsoft.Insights/scheduledQueryRules@2023-03-15-preview' =
 
 output alertRuleId string = alertRule.id
 output actionGroupId string = actionGroup.id
+output webhookUrl string = webhookUrl
+output analysisMode string = analysisMode

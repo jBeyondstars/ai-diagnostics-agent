@@ -163,22 +163,46 @@ az role assignment create \
 ### 5. Deploy Alert Rule
 
 ```bash
+# Standard mode (fast, no tools - recommended for simple bugs)
 az deployment group create \
   --resource-group rg-dev \
   --template-file infra/alert-rule.bicep \
   --parameters \
-    webhookUrl="https://your-agent.azurecontainerapps.io/api/diagnostics/webhook/alert" \
+    agentBaseUrl="https://your-agent.azurecontainerapps.io" \
+    analysisMode="standard" \
+    appInsightsId="/subscriptions/.../microsoft.insights/components/your-app-insights" \
+    logAnalyticsId="/subscriptions/.../Microsoft.OperationalInsights/workspaces/your-workspace"
+
+# Hybrid mode (Claude can use tools if needed - better for complex bugs)
+az deployment group create \
+  --resource-group rg-dev \
+  --template-file infra/alert-rule.bicep \
+  --parameters \
+    agentBaseUrl="https://your-agent.azurecontainerapps.io" \
+    analysisMode="hybrid" \
     appInsightsId="/subscriptions/.../microsoft.insights/components/your-app-insights" \
     logAnalyticsId="/subscriptions/.../Microsoft.OperationalInsights/workspaces/your-workspace"
 ```
+
+### Analysis Modes
+
+| Mode | Endpoint | Tools | Best For |
+|------|----------|-------|----------|
+| `standard` | `/webhook/alert` | No | Simple bugs (NullRef, DivideByZero) - Fast, 1 LLM call |
+| `hybrid` | `/webhook/alert-hybrid` | Yes (if needed) | Complex bugs requiring investigation |
 
 ## API Endpoints
 
 ### Webhook (Azure Monitor)
 
 ```bash
-# Called automatically by Azure Monitor Action Group
+# Standard mode - Called automatically by Azure Monitor Action Group
 POST /api/diagnostics/webhook/alert
+Content-Type: application/json
+# Body: Azure Monitor Common Alert Schema
+
+# Hybrid mode - Claude can use tools if it needs more context
+POST /api/diagnostics/webhook/alert-hybrid
 Content-Type: application/json
 # Body: Azure Monitor Common Alert Schema
 ```

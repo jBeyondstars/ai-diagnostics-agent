@@ -369,7 +369,7 @@ public sealed class DiagnosticsAgent(
     /// <summary>
     /// Result of analyzing a single exception
     /// </summary>
-    private sealed record SingleExceptionResult(
+    public sealed record SingleExceptionResult(
         string Action,       // "fix", "no_fix_needed", "error"
         string? RootCause,
         CodeFix? Fix,
@@ -789,6 +789,153 @@ public sealed class DiagnosticsAgent(
             }
         }
 #pragma warning restore SKEXP0110
+    }
+
+    /// <summary>
+    /// Hybrid analysis: Pre-fetches data but allows Claude to use tools if needed.
+    /// Best of both worlds - fast when data is sufficient, flexible when more context is needed.
+    /// </summary>
+    public async Task<SingleExceptionResult> AnalyzeHybridAsync(
+        ExceptionInfo exception,
+        bool createPr,
+        CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Starting hybrid analysis for {Type}", exception.ExceptionType);
+
+        GetOrCreateAgent();
+
+        // pre-fetch source file
+        string? fileContent = null;
+        if (!string.IsNullOrEmpty(exception.SourceFile) && _gitHubPlugin != null)
+        {
+            try
+            {
+                var json = await _gitHubPlugin.GetFileContentAsync(exception.SourceFile);
+                using var doc = JsonDocument.Parse(json);
+                if (doc.RootElement.TryGetProperty("content", out var contentProp))
+                {
+                    fileContent = contentProp.GetString();
+                    if (fileContent?.Length > 15000)
+                        fileContent = fileContent[..15000] + "\n... (truncated)";
+                }
+                logger.LogInformation("Pre-fetched source file: {File} ({Length} chars)",
+                    exception.SourceFile, fileContent?.Length ?? 0);
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Failed to pre-fetch source file: {File}", exception.SourceFile);
+            }
+        }
+
+        var contextBuilder = new System.Text.StringBuilder();
+        contextBuilder.AppendLine("# Exception to Analyze");
+        contextBuilder.AppendLine();
+        contextBuilder.AppendLine($"**Type**: {exception.ExceptionType}");
+        contextBuilder.AppendLine($"**Message**: {exception.Message}");
+        contextBuilder.AppendLine($"**Occurrences**: {exception.OccurrenceCount}");
+        contextBuilder.AppendLine($"**Operation**: {exception.OperationName}");
+        contextBuilder.AppendLine($"**Source File**: {exception.SourceFile ?? "Unknown"}");
+        contextBuilder.AppendLine($"**Line**: {exception.LineNumber?.ToString() ?? "Unknown"}");
+        contextBuilder.AppendLine();
+        contextBuilder.AppendLine("**Stack Trace**:");
+        contextBuilder.AppendLine("```");
+        contextBuilder.AppendLine(exception.StackTrace);
+        contextBuilder.AppendLine("```");
+
+        if (!string.IsNullOrEmpty(fileContent))
+        {
+            contextBuilder.AppendLine();
+            contextBuilder.AppendLine($"## Source Code (Pre-fetched): {exception.SourceFile}");
+            contextBuilder.AppendLine("```csharp");
+            var lines = fileContent.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+            {
+                contextBuilder.AppendLine($"{i + 1,4}: {lines[i]}");
+            }
+            contextBuilder.AppendLine("```");
+        }
+
+        // HYBRID PROMPT: Tells Claude to use tools ONLY if needed
+        var prompt = $$"""
+            You are an expert .NET developer. Analyze this production exception.
+
+            {{contextBuilder}}
+
+            ## Instructions
+
+            I have PRE-FETCHED the source code above. Analyze it to find the root cause.
+
+            **IMPORTANT**: Only use tools if absolutely necessary:
+            - Use `GitHub_get_file_content` if you need to see OTHER files (imports, base classes, related services)
+            - Use `GitHub_search_code` if you need to find where a class/method is defined
+            - Use `AppInsights_get_exception_details` if you need more stack trace samples
+            - Do NOT call tools if the pre-fetched code is sufficient!
+
+            ## Analysis Steps
+
+            1. First, analyze the pre-fetched code to identify the bug
+            2. If you need more context, use the tools
+            3. Determine if this is an INPUT VALIDATION error (client's fault) or an ACTUAL BUG
+            4. If it's a bug, propose a fix
+
+            ## Response Format
+
+            Respond with JSON:
+            ```json
+            {
+                "action": "fix" or "no_fix_needed",
+                "rootCause": "explanation",
+                "severity": "High|Medium|Low",
+                "toolsUsed": ["list of tools you called, or empty if none"],
+                "fix": {
+                    "filePath": "path/to/file.cs",
+                    "originalCode": "EXACT code to replace",
+                    "fixedCode": "corrected code",
+                    "explanation": "what was wrong and how the fix addresses it",
+                    "confidence": "High|Medium|Low"
+                }
+            }
+            ```
+
+            If action is "no_fix_needed", omit the "fix" object.
+            """;
+
+        var chatHistory = new ChatHistory();
+        chatHistory.AddUserMessage(prompt);
+
+        var chatService = _kernel.GetRequiredService<IChatCompletionService>();
+        var response = await chatService.GetChatMessageContentsAsync(
+            chatHistory,
+            kernel: _kernel,
+            cancellationToken: cancellationToken);
+
+        var fullResponse = string.Join("", response.Select(r => r.Content));
+        logger.LogDebug("Hybrid analysis response for {Type}: {Response}",
+            exception.ExceptionType, fullResponse.Length > 500 ? fullResponse[..500] + "..." : fullResponse);
+
+        var parsed = ParseSingleExceptionResponse(fullResponse);
+
+        if (parsed.Action == "no_fix_needed")
+        {
+            logger.LogInformation("Exception {Type} marked as no_fix_needed: {Reason}",
+                exception.ExceptionType, parsed.RootCause);
+            return new SingleExceptionResult("no_fix_needed", parsed.RootCause, null, null);
+        }
+
+        if (parsed.Fix is null)
+        {
+            logger.LogWarning("No fix provided for {Type}", exception.ExceptionType);
+            return new SingleExceptionResult("error", "No fix provided by Claude", null, null);
+        }
+
+        // Create PR if requested
+        string? prUrl = null;
+        if (createPr && _gitHubPlugin != null)
+        {
+            prUrl = await CreateSingleExceptionPrAsync(exception, parsed.Fix, cancellationToken);
+        }
+
+        return new SingleExceptionResult("fix", parsed.RootCause, parsed.Fix, prUrl);
     }
 
     /// <summary>

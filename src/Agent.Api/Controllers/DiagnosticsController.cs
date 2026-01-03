@@ -393,7 +393,8 @@ public partial class DiagnosticsController(
                 await deduplicationService.ClearByPatternAsync(exceptionType, cancellationToken);
                 logger.LogInformation("Cleared cache for exception type: {Type}", exceptionType);
 
-                return Ok(new {
+                return Ok(new
+                {
                     message = $"PR #{prNumber} closed - cache cleared for {exceptionType}",
                     exceptionType
                 });
@@ -418,6 +419,313 @@ public partial class DiagnosticsController(
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Webhook endpoint for Azure Monitor alerts using HYBRID analysis.
+    /// Unlike the standard webhook, this allows Claude to use tools if it needs more context.
+    /// </summary>
+    /// <remarks>
+    /// Use this webhook when you want Claude to be able to investigate further:
+    /// - Look at related files (imports, base classes)
+    /// - Search for class/method definitions
+    /// - Get more exception samples from AppInsights
+    ///
+    /// Configure this URL in your Azure Monitor Action Group as an alternative to /webhook/alert
+    /// </remarks>
+    [HttpPost("webhook/alert-hybrid")]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status429TooManyRequests)]
+    public async Task<ActionResult<WebhookResponse>> OnAlertWebhookHybrid(
+        [FromBody] JsonElement alertPayload,
+        CancellationToken cancellationToken)
+    {
+        logger.LogInformation("Received Azure Monitor alert webhook (HYBRID mode)");
+
+        try
+        {
+            string alertId = "unknown";
+            string alertRule = "unknown";
+            string severity = "Sev3";
+
+            if (alertPayload.TryGetProperty("data", out var data) &&
+                data.TryGetProperty("essentials", out var essentials))
+            {
+                if (essentials.TryGetProperty("alertId", out var alertIdProp))
+                    alertId = alertIdProp.GetString() ?? "unknown";
+
+                if (essentials.TryGetProperty("alertRule", out var ruleProp))
+                    alertRule = ruleProp.GetString() ?? "unknown";
+
+                if (essentials.TryGetProperty("severity", out var sevProp))
+                    severity = sevProp.GetString() ?? "Sev3";
+            }
+
+            logger.LogInformation("Alert received (HYBRID): Rule={Rule}, Severity={Severity}, AlertId={AlertId}",
+                alertRule, severity, alertId);
+
+            var debounceKey = $"webhook:debounce:hybrid:{alertRule}";
+            var lastProcessed = await cache.GetStringAsync(debounceKey, cancellationToken);
+
+            if (lastProcessed != null)
+            {
+                logger.LogInformation("Debouncing hybrid alert {Rule} - last processed at {Time}", alertRule, lastProcessed);
+                return StatusCode(429, new WebhookResponse
+                {
+                    Status = "debounced",
+                    Message = $"Alert was recently processed. Next analysis allowed after debounce period.",
+                    AlertRule = alertRule,
+                    LastProcessedAt = lastProcessed
+                });
+            }
+
+            await cache.SetStringAsync(
+                debounceKey,
+                DateTimeOffset.UtcNow.ToString("O"),
+                new DistributedCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = WebhookDebounce
+                },
+                cancellationToken);
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    logger.LogInformation("Starting HYBRID background analysis triggered by alert {Rule}", alertRule);
+
+                    // Phase 1: Fetch exceptions directly
+                    var appInsightsPlugin = new Agent.Plugins.AppInsightsPlugin(
+                        config.Value.AppInsights.WorkspaceId,
+                        logger as ILogger<Agent.Plugins.AppInsightsPlugin>);
+
+                    var exceptionsJson = await appInsightsPlugin.GetExceptionsAsync(
+                        hours: 1,
+                        minOccurrences: 1,
+                        maxResults: 10);
+
+                    using var doc = JsonDocument.Parse(exceptionsJson);
+                    if (doc.RootElement.ValueKind != JsonValueKind.Array)
+                    {
+                        logger.LogInformation("No exceptions found for hybrid analysis");
+                        return;
+                    }
+
+                    var exceptions = doc.RootElement.EnumerateArray()
+                        .Select(item => new ExceptionInfo
+                        {
+                            ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
+                            Message = item.TryGetProperty("Message", out var msg) ? msg.GetString() ?? "" : "",
+                            StackTrace = item.TryGetProperty("StackTrace", out var st) ? st.GetString() ?? "" : "",
+                            OperationName = item.TryGetProperty("OperationName", out var op) ? op.GetString() ?? "" : "",
+                            Timestamp = DateTimeOffset.UtcNow,
+                            OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
+                            ProblemId = item.TryGetProperty("ProblemId", out var pid) ? pid.GetString() : null,
+                            SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
+                            LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number
+                                ? ln.GetInt32() : null,
+                            ItemId = item.TryGetProperty("ItemId", out var iid) ? iid.GetString() : null,
+                            ItemTimestamp = item.TryGetProperty("Timestamp", out var its) ? its.GetString() : null
+                        })
+                        .Take(10)
+                        .ToList();
+
+                    logger.LogInformation("Found {Count} exceptions for hybrid analysis", exceptions.Count);
+
+                    // Phase 2: Analyze each with hybrid approach
+                    int prsCreated = 0;
+                    foreach (var exception in exceptions)
+                    {
+                        try
+                        {
+                            var result = await agent.AnalyzeHybridAsync(
+                                exception,
+                                createPr: true,
+                                CancellationToken.None);
+
+                            if (!string.IsNullOrEmpty(result.PrUrl))
+                            {
+                                prsCreated++;
+                                logger.LogInformation("HYBRID: Created PR for {Type}: {Url}",
+                                    exception.ExceptionType, result.PrUrl);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogError(ex, "HYBRID: Error analyzing {Type}", exception.ExceptionType);
+                        }
+                    }
+
+                    logger.LogInformation("HYBRID background analysis completed: {PRs} PRs created", prsCreated);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "HYBRID background analysis failed for alert {Rule}", alertRule);
+                }
+            }, cancellationToken);
+
+            return Ok(new WebhookResponse
+            {
+                Status = "accepted",
+                Message = "Alert received. HYBRID analysis started in background (Claude can use tools if needed).",
+                AlertRule = alertRule,
+                TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
+            });
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error processing hybrid alert webhook");
+            return Ok(new WebhookResponse
+            {
+                Status = "error",
+                Message = ex.Message
+            });
+        }
+    }
+
+    /// <summary>
+    /// Hybrid analysis: Pre-fetches data but allows Claude to use tools if it needs more context.
+    /// Best of both worlds - fast when data is sufficient, flexible when more investigation is needed.
+    /// </summary>
+    /// <remarks>
+    /// This endpoint uses an optimized hybrid approach:
+    /// 1. Pre-fetches exception data from AppInsights
+    /// 2. Pre-fetches source code from GitHub
+    /// 3. Sends everything to Claude WITH tools available
+    /// 4. Claude analyzes the pre-fetched data first
+    /// 5. Claude can call tools ONLY if it needs more context (other files, more traces, etc.)
+    ///
+    /// This reduces API calls compared to pure agent mode while maintaining flexibility.
+    /// </remarks>
+    /// <param name="request">Analysis request parameters</param>
+    [HttpPost("analyze-hybrid")]
+    [ProducesResponseType<HybridAnalysisResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
+    public async Task<ActionResult<HybridAnalysisResponse>> AnalyzeHybrid(
+        [FromBody] HybridAnalysisRequest? request,
+        CancellationToken cancellationToken)
+    {
+        request ??= new HybridAnalysisRequest();
+
+        logger.LogInformation(
+            "Starting hybrid analysis: hours={Hours}, createPR={CreatePR}",
+            request.HoursToAnalyze,
+            request.CreatePullRequest);
+
+        // Phase 1: Fetch exceptions (directly, not via Claude)
+        var appInsightsPlugin = new Agent.Plugins.AppInsightsPlugin(
+            config.Value.AppInsights.WorkspaceId,
+            logger as ILogger<Agent.Plugins.AppInsightsPlugin>);
+
+        var exceptionsJson = await appInsightsPlugin.GetExceptionsAsync(
+            request.HoursToAnalyze,
+            request.MinOccurrences,
+            request.MaxExceptions);
+
+        List<ExceptionInfo> exceptions;
+        try
+        {
+            using var doc = JsonDocument.Parse(exceptionsJson);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array)
+            {
+                return Ok(new HybridAnalysisResponse
+                {
+                    Status = "no_exceptions",
+                    Message = "No exceptions found matching criteria",
+                    ExceptionsAnalyzed = 0
+                });
+            }
+
+            exceptions = doc.RootElement.EnumerateArray()
+                .Select(item => new ExceptionInfo
+                {
+                    ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
+                    Message = item.TryGetProperty("Message", out var msg) ? msg.GetString() ?? "" : "",
+                    StackTrace = item.TryGetProperty("StackTrace", out var st) ? st.GetString() ?? "" : "",
+                    OperationName = item.TryGetProperty("OperationName", out var op) ? op.GetString() ?? "" : "",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
+                    ProblemId = item.TryGetProperty("ProblemId", out var pid) ? pid.GetString() : null,
+                    SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
+                    LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number
+                        ? ln.GetInt32() : null,
+                    ItemId = item.TryGetProperty("ItemId", out var iid) ? iid.GetString() : null,
+                    ItemTimestamp = item.TryGetProperty("Timestamp", out var its) ? its.GetString() : null
+                })
+                .ToList();
+        }
+        catch (JsonException ex)
+        {
+            logger.LogWarning(ex, "Failed to parse exceptions JSON");
+            return BadRequest(new ProblemDetails
+            {
+                Title = "Invalid response from AppInsights",
+                Detail = ex.Message
+            });
+        }
+
+        if (exceptions.Count == 0)
+        {
+            return Ok(new HybridAnalysisResponse
+            {
+                Status = "no_exceptions",
+                Message = "No exceptions found matching criteria",
+                ExceptionsAnalyzed = 0
+            });
+        }
+
+        logger.LogInformation("Found {Count} exceptions, starting hybrid analysis", exceptions.Count);
+
+        // Phase 2: Analyze each exception with hybrid approach
+        var results = new List<HybridExceptionResult>();
+        var prsCreated = new List<string>();
+
+        foreach (var exception in exceptions.Take(request.MaxExceptions))
+        {
+            try
+            {
+                var result = await agent.AnalyzeHybridAsync(
+                    exception,
+                    request.CreatePullRequest,
+                    cancellationToken);
+
+                results.Add(new HybridExceptionResult
+                {
+                    ExceptionType = exception.ExceptionType,
+                    Action = result.Action,
+                    RootCause = result.RootCause,
+                    PrUrl = result.PrUrl,
+                    FixProposed = result.Fix != null
+                });
+
+                if (!string.IsNullOrEmpty(result.PrUrl))
+                {
+                    prsCreated.Add(result.PrUrl);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(ex, "Error in hybrid analysis for {Type}", exception.ExceptionType);
+                results.Add(new HybridExceptionResult
+                {
+                    ExceptionType = exception.ExceptionType,
+                    Action = "error",
+                    RootCause = ex.Message,
+                    FixProposed = false
+                });
+            }
+        }
+
+        return Ok(new HybridAnalysisResponse
+        {
+            Status = "completed",
+            Message = $"Analyzed {results.Count} exceptions with hybrid approach",
+            ExceptionsAnalyzed = results.Count,
+            FixesProposed = results.Count(r => r.FixProposed),
+            PullRequestsCreated = prsCreated.Count,
+            PullRequestUrls = prsCreated,
+            Results = results
+        });
     }
 
     /// <summary>
@@ -499,4 +807,48 @@ public record AppInsightsTestResult
     public required string Message { get; init; }
     public string? Error { get; init; }
     public List<string>? AvailableTables { get; init; }
+}
+
+/// <summary>
+/// Request for hybrid analysis endpoint
+/// </summary>
+public record HybridAnalysisRequest
+{
+    /// <summary>Hours to look back for exceptions</summary>
+    public int HoursToAnalyze { get; init; } = 24;
+
+    /// <summary>Minimum occurrences to consider an exception</summary>
+    public int MinOccurrences { get; init; } = 1;
+
+    /// <summary>Maximum number of exceptions to analyze</summary>
+    public int MaxExceptions { get; init; } = 5;
+
+    /// <summary>Whether to create PRs for fixes</summary>
+    public bool CreatePullRequest { get; init; } = false;
+}
+
+/// <summary>
+/// Response from hybrid analysis endpoint
+/// </summary>
+public record HybridAnalysisResponse
+{
+    public required string Status { get; init; }
+    public string? Message { get; init; }
+    public int ExceptionsAnalyzed { get; init; }
+    public int FixesProposed { get; init; }
+    public int PullRequestsCreated { get; init; }
+    public List<string>? PullRequestUrls { get; init; }
+    public List<HybridExceptionResult>? Results { get; init; }
+}
+
+/// <summary>
+/// Result for a single exception in hybrid analysis
+/// </summary>
+public record HybridExceptionResult
+{
+    public required string ExceptionType { get; init; }
+    public required string Action { get; init; }
+    public string? RootCause { get; init; }
+    public string? PrUrl { get; init; }
+    public bool FixProposed { get; init; }
 }
