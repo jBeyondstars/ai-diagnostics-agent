@@ -132,8 +132,8 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
         var subtotal = order.Items.Sum(i => i.Price * i.Quantity);
         var discountAmount = order.Discount?.Percentage ?? 0;
 
-        // BUG: subtotal is 0 for order 1003 (empty items) - division by zero
-        var effectiveRate = (discountAmount * 100) / subtotal;
+        // Prevent division by zero for orders with no items or zero subtotal
+        var effectiveRate = subtotal > 0 ? (discountAmount * 100) / subtotal : 0;
 
         logger.LogInformation("Discount rate: {Rate}%", effectiveRate);
 
