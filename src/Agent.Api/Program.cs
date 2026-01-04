@@ -1,4 +1,5 @@
 using Agent.Api.Middleware;
+using Agent.Api.Services;
 using Agent.Core;
 using Agent.Core.Configuration;
 using Agent.Core.Services;
@@ -28,6 +29,7 @@ else
 }
 
 builder.Services.AddSingleton<DiagnosticsAgent>();
+builder.Services.AddSingleton<PricingService>();
 
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
