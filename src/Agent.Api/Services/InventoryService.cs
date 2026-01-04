@@ -39,13 +39,17 @@ public class InventoryService(ILogger<InventoryService> logger)
         var item = GetInventory(productId);
         if (item == null)
         {
-            // BUG: Returns 0 which will cause DivideByZeroException in callers
-            // that use this as a divisor
-            return 0;
+            // Product not found - throw exception so callers know the product doesn't exist
+            throw new KeyNotFoundException($"Product with ID {productId} not found in inventory.");
         }
 
         if (avgDailySales <= 0)
             return int.MaxValue;
+
+        // Handle out-of-stock items: return 0 only for actual zero stock
+        // Callers should check for this case before using as divisor
+        if (item.QuantityInStock == 0)
+            return 0;
 
         return item.QuantityInStock / avgDailySales;
     }
