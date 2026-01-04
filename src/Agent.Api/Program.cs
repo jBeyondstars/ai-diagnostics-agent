@@ -30,6 +30,7 @@ else
 
 builder.Services.AddSingleton<DiagnosticsAgent>();
 builder.Services.AddSingleton<PricingService>();
+builder.Services.AddSingleton<InventoryService>();
 
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
