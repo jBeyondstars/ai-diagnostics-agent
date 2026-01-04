@@ -34,7 +34,7 @@ public class ProductsController(
     [ProducesResponseType<ProductPriceResponse>(StatusCodes.Status200OK)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status404NotFound)]
     [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
-    public ActionResult<ProductPriceResponse> GetProductPrice(int id, [FromQuery] string customerTier = "bronze")
+    public ActionResult<ProductPriceResponse> GetProductPrice([FromRoute] int id, [FromQuery] string customerTier = "bronze")
     {
         logger.LogInformation("Getting price for product {ProductId} with tier {Tier}", id, customerTier);
 
