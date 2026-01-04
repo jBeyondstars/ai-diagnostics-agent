@@ -73,7 +73,12 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
 
         var customer = _customers[order.CustomerId];
 
-        // BUG: customer.Address can be null (Customer ID 2 has no address)
+        // Check if customer has a shipping address on file
+        if (customer.Address is null)
+        {
+            return BadRequest(new { message = $"Customer {customer.Name} does not have a shipping address on file" });
+        }
+
         var shippingCity = customer.Address.City;
         var shippingCountry = customer.Address.Country;
 
