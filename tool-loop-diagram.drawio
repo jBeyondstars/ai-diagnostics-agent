@@ -1,0 +1,124 @@
+<mxfile host="app.diagrams.net" modified="2025-01-03T12:00:00.000Z" agent="Claude" version="21.0.0">
+  <diagram name="Tool Loop" id="tool-loop-diagram">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1200" pageHeight="800" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Headers -->
+        <mxCell id="header-backend" value="BACKEND" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="120" y="30" width="160" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="header-claude" value="AI API (Claude)" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=18;fontStyle=1;fontColor=#333333;" vertex="1" parent="1">
+          <mxGeometry x="520" y="30" width="180" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Divider line -->
+        <mxCell id="divider" value="" style="endArrow=none;dashed=1;html=1;strokeWidth=1;strokeColor=#CCCCCC;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="400" y="700" as="sourcePoint" />
+            <mxPoint x="400" y="60" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Backend Box 1: Send prompt -->
+        <mxCell id="backend-1" value="Send prompt + tools" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;fontStyle=0;" vertex="1" parent="1">
+          <mxGeometry x="100" y="80" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Claude Box 1: Tool request -->
+        <mxCell id="claude-1" value="I need to call&lt;br&gt;&lt;b&gt;AppInsights_get_exceptions&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="480" y="120" width="220" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 1: Backend to Claude (request) -->
+        <mxCell id="arrow-1" value="Analyze production errors" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="backend-1" target="claude-1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Backend Box 2: Execute App Insights -->
+        <mxCell id="backend-2" value="Execute&lt;br&gt;&lt;b&gt;App Insights&lt;/b&gt; query" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="200" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 2: Claude to Backend (tool call) -->
+        <mxCell id="arrow-2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;endArrow=classic;" edge="1" parent="1" source="claude-1" target="backend-2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Claude Box 2: Execute query (internal) -->
+        <mxCell id="claude-2" value="Execute query" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="520" y="220" width="140" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 3: Backend to Claude (results) -->
+        <mxCell id="arrow-3" value="Return results" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="backend-2" target="claude-2">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Claude Box 3: Analysis -->
+        <mxCell id="claude-3" value="I found 3 critical exceptions.&lt;br&gt;Let me check the source code..." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="480" y="310" width="220" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 4: Internal Claude flow -->
+        <mxCell id="arrow-4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;" edge="1" parent="1" source="claude-2" target="claude-3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Backend Box 3: Receive analysis -->
+        <mxCell id="backend-3" value="Receive analysis" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="320" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 5: Claude to Backend (analysis) -->
+        <mxCell id="arrow-5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;" edge="1" parent="1" source="claude-3" target="backend-3">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Claude Box 4: GitHub tool request -->
+        <mxCell id="claude-4" value="I need to call&lt;br&gt;&lt;b&gt;GitHub_get_file_content&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="480" y="420" width="220" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 6: Backend detects new tool call -->
+        <mxCell id="arrow-6" value="Detect tool request" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;fontSize=10;labelBackgroundColor=#FFFFFF;" edge="1" parent="1" source="backend-3" target="claude-4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Backend Box 4: Execute GitHub -->
+        <mxCell id="backend-4" value="Execute&lt;br&gt;&lt;b&gt;GitHub&lt;/b&gt; query" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="100" y="440" width="180" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow 7: Claude to Backend (GitHub tool call) -->
+        <mxCell id="arrow-7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;orthogonalLoop=1;jettySize=auto;html=1;strokeColor=#666666;" edge="1" parent="1" source="claude-4" target="backend-4">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- And so on label -->
+        <mxCell id="continue" value="... and so on" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=12;fontStyle=2;fontColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="320" y="530" width="160" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Arrow continue -->
+        <mxCell id="arrow-continue" value="" style="endArrow=classic;html=1;strokeColor=#666666;dashed=1;" edge="1" parent="1">
+          <mxGeometry width="50" height="50" relative="1" as="geometry">
+            <mxPoint x="280" y="550" as="sourcePoint" />
+            <mxPoint x="520" y="550" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Icons (represented as shapes) -->
+        <mxCell id="icon-appinsights" value="💡" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=24;" vertex="1" parent="1">
+          <mxGeometry x="710" y="130" width="40" height="40" as="geometry" />
+        </mxCell>
+
+        <mxCell id="icon-github" value="⚫" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;whiteSpace=wrap;rounded=0;fontSize=24;" vertex="1" parent="1">
+          <mxGeometry x="710" y="430" width="40" height="40" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

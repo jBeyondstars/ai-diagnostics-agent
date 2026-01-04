@@ -147,17 +147,26 @@ public sealed class AnthropicChatCompletionService(
         var toolResultContents = new List<ContentBase>();
         var assistantContent = new List<ContentBase>();
 
+        var toolCallsInRound = 0;
+
         foreach (var block in response.Content)
         {
             if (block is ToolUseContent toolUse)
             {
                 assistantContent.Add(toolUse);
+                toolCallsInRound++;
 
-                logger?.LogInformation("Claude calling tool: {ToolName}", toolUse.Name);
+                var inputJson = toolUse.Input?.ToString() ?? "{}";
+                var truncatedInput = inputJson.Length > 200 ? inputJson[..200] + "..." : inputJson;
+                logger?.LogInformation("Tool call [{Round}.{Index}]: {ToolName} with input: {Input}",
+                    currentRound, toolCallsInRound, toolUse.Name, truncatedInput);
 
                 var result = await InvokeKernelFunctionAsync(kernel, toolUse, cancellationToken);
 
-                // Truncate long results to save tokens
+                var truncatedResult = result.Length > 300 ? result[..300] + "..." : result;
+                logger?.LogInformation("Tool result [{Round}.{Index}]: {ToolName} returned {Length} chars: {Result}",
+                    currentRound, toolCallsInRound, toolUse.Name, result.Length, truncatedResult);
+
                 if (result.Length > MaxToolResultLength)
                 {
                     result = result[..MaxToolResultLength] + "\n... (truncated)";
@@ -174,6 +183,8 @@ public sealed class AnthropicChatCompletionService(
                 assistantContent.Add(textContent);
             }
         }
+
+        logger?.LogInformation("Round {Round} completed: {ToolCount} tool(s) called", currentRound, toolCallsInRound);
 
         var newMessages = accumulatedMessages ?? ConvertToAnthropicMessages(chatHistory);
 
