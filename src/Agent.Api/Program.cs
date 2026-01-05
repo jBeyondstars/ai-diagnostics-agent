@@ -1,5 +1,6 @@
-using Agent.Api.Middleware;
+using Agent.Api.Infrastructure;
 using Agent.Api.Services;
+using Agent.Api.Services.Background;
 using Agent.Core;
 using Agent.Core.Configuration;
 using Agent.Core.Services;
@@ -32,6 +33,14 @@ builder.Services.AddSingleton<DiagnosticsAgent>();
 builder.Services.AddSingleton<PricingService>();
 builder.Services.AddSingleton<InventoryService>();
 
+// Background processing for alerts
+builder.Services.AddSingleton<AlertChannel>();
+builder.Services.AddHostedService<AlertProcessor>();
+
+// Standard Global Exception Handler
+builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
+builder.Services.AddProblemDetails();
+
 builder.Services.AddControllers()
     .AddJsonOptions(options =>
     {
@@ -48,18 +57,10 @@ builder.Services.AddOpenApi(options =>
         document.Info.Description = """
             API to trigger and monitor the AI Diagnostics Agent.
             Built with .NET 10 and Semantic Kernel 1.45+.
-
-            ## Test Endpoints
-            Use `/api/testexceptions/*` to generate test exceptions for Application Insights.
-
-            ## Diagnostics Endpoints
-            Use `/api/diagnostics/*` for actual agent operations.
             """;
         return Task.CompletedTask;
     });
 });
-
-builder.Services.AddProblemDetails();
 
 // Configure forwarded headers for Azure Container Apps reverse proxy
 builder.Services.Configure<ForwardedHeadersOptions>(options =>
@@ -82,10 +83,9 @@ builder.Services.AddCors(options =>
 
 var app = builder.Build();
 
-// Handle forwarded headers from Azure Container Apps reverse proxy (configured in services)
 app.UseForwardedHeaders();
 
-app.UseGlobalExceptionHandler();
+app.UseExceptionHandler(); 
 
 app.UseCors();
 
