@@ -17,8 +17,12 @@ public sealed class PricingService(ILogger<PricingService> logger)
     {
         logger.LogInformation("Calculating price for tier {Tier}, base price {Price}", customerTier, basePrice);
 
-        // Demo Bug: Throws KeyNotFoundException for unknown tiers
-        var discountRate = _tierDiscounts[customerTier.ToLower()];
+        var normalizedTier = customerTier?.ToLower() ?? string.Empty;
+        if (!_tierDiscounts.TryGetValue(normalizedTier, out var discountRate))
+        {
+            logger.LogWarning("Unknown customer tier '{Tier}', applying no discount", customerTier);
+            discountRate = 0m; // No discount for unknown tiers
+        }
         return basePrice * (1 - discountRate);
     }
 
