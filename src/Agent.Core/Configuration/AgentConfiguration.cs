@@ -108,32 +108,23 @@ public sealed class LlmConfiguration
 /// </summary>
 public sealed class AnthropicConfiguration
 {
-    public string ApiKey { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Model to use.
-    /// </summary>
+    public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "claude-sonnet-4-5-20250929";
 }
 
 public sealed class OpenAIConfiguration
 {
-    public string ApiKey { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Model to use.
-    /// </summary>
-    public string Model { get; set; } = string.Empty;
-
+    public string ApiKey { get; set; } = "";
+    public string Model { get; set; } = "";
     public string? Organization { get; set; }
 }
 
 public sealed class AzureOpenAIConfiguration
 {
-    public string Endpoint { get; set; } = string.Empty;
-    public string ApiKey { get; set; } = string.Empty;
-    public string DeploymentName { get; set; } = string.Empty;
-    public string ApiVersion { get; set; } = string.Empty;
+    public string Endpoint { get; set; } = "";
+    public string ApiKey { get; set; } = "";
+    public string DeploymentName { get; set; } = "";
+    public string ApiVersion { get; set; } = "";
 }
 
 /// <summary>
@@ -142,25 +133,12 @@ public sealed class AzureOpenAIConfiguration
 public sealed class AppInsightsConfiguration
 {
     [Required]
-    public string WorkspaceId { get; set; } = string.Empty;
-
+    public string WorkspaceId { get; set; } = "";
     public bool UseManagedIdentity { get; set; } = true;
     public string? ConnectionString { get; set; }
-
-    /// <summary>
-    /// App Insights resource name (for portal deep links)
-    /// </summary>
-    public string ResourceName { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Resource group containing App Insights
-    /// </summary>
-    public string ResourceGroup { get; set; } = string.Empty;
-
-    /// <summary>
-    /// Azure subscription ID
-    /// </summary>
-    public string SubscriptionId { get; set; } = string.Empty;
+    public string ResourceName { get; set; } = "";
+    public string ResourceGroup { get; set; } = "";
+    public string SubscriptionId { get; set; } = "";
 }
 
 /// <summary>
@@ -168,15 +146,9 @@ public sealed class AppInsightsConfiguration
 /// </summary>
 public sealed class GitHubConfiguration
 {
-    [Required]
-    public string Token { get; set; } = string.Empty;
-
-    [Required]
-    public string Owner { get; set; } = string.Empty;
-
-    [Required]
-    public string Repo { get; set; } = string.Empty;
-
+    [Required] public string Token { get; set; } = "";
+    [Required] public string Owner { get; set; } = "";
+    [Required] public string Repo { get; set; } = "";
     public string DefaultBranch { get; set; } = "main";
     public bool EnableAutoMerge { get; set; }
     public string[] RequiredReviewers { get; set; } = [];

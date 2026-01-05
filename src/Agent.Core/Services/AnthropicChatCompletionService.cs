@@ -52,11 +52,11 @@ public sealed class AnthropicChatCompletionService(
             request.System = [new SystemMessage(systemPrompt)];
         }
 
-        if (tools is { Count: > 0 })
+        if (tools is { Count: > 0 } registeredTools)
         {
-            request.Tools = tools;
+            request.Tools = registeredTools;
             request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
-            logger?.LogInformation("Registered {ToolCount} tools for Claude", tools.Count);
+            logger?.LogInformation("Registered {ToolCount} tools for Claude", registeredTools.Count);
         }
 
         logger?.LogDebug("Sending request to Claude {Model} with {MessageCount} messages",
@@ -110,7 +110,7 @@ public sealed class AnthropicChatCompletionService(
             request.System = [new SystemMessage(systemPrompt)];
         }
 
-        if (tools is not null && tools.Count > 0)
+        if (tools is { Count: > 0 })
         {
             request.Tools = tools;
             request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
@@ -251,8 +251,9 @@ public sealed class AnthropicChatCompletionService(
         try
         {
             var parts = toolUse.Name.Split(['_', '-'], 2);
-            var pluginName = parts.Length > 1 ? parts[0] : string.Empty;
-            var functionName = parts.Length > 1 ? parts[1] : toolUse.Name;
+            var (pluginName, functionName) = parts.Length > 1
+                ? (parts[0], parts[1])
+                : ("", toolUse.Name);
 
             KernelFunction? function = null;
 
