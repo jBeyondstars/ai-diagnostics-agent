@@ -55,8 +55,11 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
         logger.LogInformation("Getting first item for order {OrderId}", orderId);
         if (!_orders.TryGetValue(orderId, out var order)) return NotFound();
 
-        // Demo Bug: .First() on empty list
-        var firstItem = order.Items.First();
+        var firstItem = order.Items.FirstOrDefault();
+        if (firstItem is null)
+        {
+            return NotFound($"Order {orderId} has no items");
+        }
 
         return Ok(new OrderItemDto(firstItem.ProductId, firstItem.Name, firstItem.Price, firstItem.Quantity));
     }
