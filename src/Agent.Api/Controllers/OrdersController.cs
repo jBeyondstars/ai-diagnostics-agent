@@ -39,7 +39,12 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
 
         var customer = _customers[order.CustomerId];
 
-        // Demo Bug: customer.Address can be null
+        // Fixed: Check if customer.Address is null before accessing its properties
+        if (customer.Address is null)
+        {
+            return BadRequest(new { error = "Customer does not have a shipping address on file." });
+        }
+
         return Ok(new ShippingInfo(
             orderId,
             customer.Name,
