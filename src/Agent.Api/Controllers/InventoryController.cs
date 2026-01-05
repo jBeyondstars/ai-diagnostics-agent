@@ -4,8 +4,7 @@ using Microsoft.AspNetCore.Mvc;
 namespace Agent.Api.Controllers;
 
 /// <summary>
-/// Controller for inventory operations.
-/// Used to test scenarios where exception occurs HERE but the bug is in InventoryService.
+/// Controller with intentional bugs for the Agent to diagnose.
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
@@ -14,36 +13,17 @@ public class InventoryController(
     InventoryService inventoryService,
     ILogger<InventoryController> logger) : ControllerBase
 {
-    /// <summary>
-    /// Calculates reorder urgency score for a product.
-    ///
-    /// EXCEPTION SCENARIO:
-    /// - Use productId=999 (unknown product)
-    /// - InventoryService.CalculateDaysUntilStockout returns 0 for unknown products
-    /// - This method divides by that value → DivideByZeroException HERE
-    /// - Stack trace shows THIS controller, but the fix is in InventoryService
-    /// - Claude should need to use tools to find InventoryService.cs
-    /// </summary>
-    /// <param name="productId">Product ID. Use 999 to trigger the bug.</param>
-    /// <param name="avgDailySales">Average daily sales (default: 5)</param>
     [HttpGet("{productId}/reorder-urgency")]
     [ProducesResponseType<ReorderUrgencyResponse>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
     public ActionResult<ReorderUrgencyResponse> GetReorderUrgency(
         [FromRoute] int productId,
         [FromQuery] int avgDailySales = 5)
     {
         logger.LogInformation("Calculating reorder urgency for product {ProductId}", productId);
 
-        // Get days until stockout from service
-        // BUG IN SERVICE: Returns 0 for unknown products
         var daysUntilStockout = inventoryService.CalculateDaysUntilStockout(productId, avgDailySales);
-
-        logger.LogInformation("Days until stockout: {Days}", daysUntilStockout);
-
-        // Calculate urgency score (higher = more urgent)
-        // BUG MANIFESTS HERE: Division by zero when daysUntilStockout is 0
-        // Stack trace will show THIS line, but the fix should be in InventoryService
+        
+        // DEMO BUG: Intentional DivideByZeroException when daysUntilStockout is 0
         var urgencyScore = 100 / daysUntilStockout;
 
         var urgencyLevel = urgencyScore switch
@@ -60,33 +40,19 @@ public class InventoryController(
             DaysUntilStockout = daysUntilStockout,
             UrgencyScore = urgencyScore,
             UrgencyLevel = urgencyLevel,
-            RecommendedAction = urgencyLevel == "Critical"
-                ? "Reorder immediately"
-                : $"Review in {daysUntilStockout} days"
+            RecommendedAction = urgencyLevel == "Critical" ? "Reorder immediately" : $"Review in {daysUntilStockout} days"
         });
     }
 
-    /// <summary>
-    /// Gets inventory status with stock level details.
-    ///
-    /// EXCEPTION SCENARIO:
-    /// - Use productId=999 (unknown product)
-    /// - InventoryService.GetInventory returns null for unknown products
-    /// - This method accesses .QuantityInStock → NullReferenceException HERE
-    /// - Stack trace shows THIS controller, but fix could be in either place
-    /// </summary>
     [HttpGet("{productId}/status")]
     [ProducesResponseType<InventoryStatusResponse>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
     public ActionResult<InventoryStatusResponse> GetInventoryStatus([FromRoute] int productId)
     {
         logger.LogInformation("Getting inventory status for product {ProductId}", productId);
 
-        // Get inventory from service - may return null for unknown products
         var inventory = inventoryService.GetInventory(productId);
 
-        // BUG: No null check - will throw NullReferenceException
-        // Stack trace shows THIS line, but root cause is service returning null
+        // DEMO BUG: Intentional NullReferenceException (inventory is null for unknown products)
         var stockPercentage = (inventory.QuantityInStock * 100) / Math.Max(inventory.ReorderLevel * 5, 1);
 
         var status = inventory.QuantityInStock switch
@@ -107,20 +73,20 @@ public class InventoryController(
     }
 }
 
-public class ReorderUrgencyResponse
+public record ReorderUrgencyResponse
 {
-    public int ProductId { get; set; }
-    public int DaysUntilStockout { get; set; }
-    public int UrgencyScore { get; set; }
-    public required string UrgencyLevel { get; set; }
-    public required string RecommendedAction { get; set; }
+    public int ProductId { get; init; }
+    public int DaysUntilStockout { get; init; }
+    public int UrgencyScore { get; init; }
+    public required string UrgencyLevel { get; init; }
+    public required string RecommendedAction { get; init; }
 }
 
-public class InventoryStatusResponse
+public record InventoryStatusResponse
 {
-    public int ProductId { get; set; }
-    public int QuantityInStock { get; set; }
-    public int ReorderLevel { get; set; }
-    public int StockPercentage { get; set; }
-    public required string Status { get; set; }
+    public int ProductId { get; init; }
+    public int QuantityInStock { get; init; }
+    public int ReorderLevel { get; init; }
+    public int StockPercentage { get; init; }
+    public required string Status { get; init; }
 }

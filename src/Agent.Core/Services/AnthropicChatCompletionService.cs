@@ -12,10 +12,6 @@ using Function = Anthropic.SDK.Common.Function;
 
 namespace Agent.Core.Services;
 
-/// <summary>
-/// Custom IChatCompletionService implementation for Anthropic Claude.
-/// Bridges Semantic Kernel with the Anthropic SDK v5.8+.
-/// </summary>
 public sealed class AnthropicChatCompletionService(
     string apiKey,
     string modelId = AnthropicModels.Claude41Opus,
@@ -33,11 +29,11 @@ public sealed class AnthropicChatCompletionService(
         ChatHistory chatHistory,
         PromptExecutionSettings? executionSettings = null,
         Kernel? kernel = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken ct = default)
     {
-        var messages = ConvertToAnthropicMessages(chatHistory);
+        var messages = ConvertMessages(chatHistory);
         var systemPrompt = ExtractSystemPrompt(chatHistory);
-        var tools = kernel is not null ? ConvertKernelFunctionsToTools(kernel) : null;
+        var tools = kernel is not null ? ConvertTools(kernel) : null;
 
         var request = new MessageParameters
         {
@@ -47,374 +43,183 @@ public sealed class AnthropicChatCompletionService(
             Temperature = GetTemperature(executionSettings)
         };
 
-        if (!string.IsNullOrEmpty(systemPrompt))
-        {
-            request.System = [new SystemMessage(systemPrompt)];
-        }
+        if (!string.IsNullOrEmpty(systemPrompt)) request.System = [new SystemMessage(systemPrompt)];
 
-        if (tools is { Count: > 0 } registeredTools)
+        if (tools is { Count: > 0 })
         {
-            request.Tools = registeredTools;
+            request.Tools = tools;
             request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
-            logger?.LogInformation("Registered {ToolCount} tools for Claude", registeredTools.Count);
+            logger?.LogInformation("Registered {Count} tools", tools.Count);
         }
 
-        logger?.LogDebug("Sending request to Claude {Model} with {MessageCount} messages",
-            modelId, messages.Count);
-
-        var response = await _client.Messages.GetClaudeMessageAsync(request, cancellationToken);
+        var response = await _client.Messages.GetClaudeMessageAsync(request, ct);
 
         if (response.StopReason == "tool_use" && kernel is not null)
         {
-            return await HandleToolCallsAsync(response, chatHistory, kernel, executionSettings, cancellationToken);
+            return await HandleToolCallsAsync(response, chatHistory, kernel, executionSettings, ct);
         }
 
-        var content = ExtractTextContent(response);
-
-        return
-        [
-            new ChatMessageContent(AuthorRole.Assistant, content)
-            {
-                ModelId = modelId,
-                Metadata = new Dictionary<string, object?>
-                {
-                    ["StopReason"] = response.StopReason,
-                    ["InputTokens"] = response.Usage?.InputTokens,
-                    ["OutputTokens"] = response.Usage?.OutputTokens
-                }
-            }
-        ];
+        return [CreateMessageContent(response)];
     }
 
     public async IAsyncEnumerable<StreamingChatMessageContent> GetStreamingChatMessageContentsAsync(
         ChatHistory chatHistory,
         PromptExecutionSettings? executionSettings = null,
         Kernel? kernel = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
-        var messages = ConvertToAnthropicMessages(chatHistory);
-        var systemPrompt = ExtractSystemPrompt(chatHistory);
-        var tools = kernel is not null ? ConvertKernelFunctionsToTools(kernel) : null;
-
         var request = new MessageParameters
         {
             Model = modelId,
             MaxTokens = GetMaxTokens(executionSettings),
-            Messages = messages,
+            Messages = ConvertMessages(chatHistory),
             Temperature = GetTemperature(executionSettings),
             Stream = true
         };
+        
+        var systemPrompt = ExtractSystemPrompt(chatHistory);
+        if (!string.IsNullOrEmpty(systemPrompt)) request.System = [new SystemMessage(systemPrompt)];
 
-        if (!string.IsNullOrEmpty(systemPrompt))
-        {
-            request.System = [new SystemMessage(systemPrompt)];
-        }
-
-        if (tools is { Count: > 0 })
-        {
-            request.Tools = tools;
-            request.ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto };
-        }
-
-        await foreach (var response in _client.Messages.StreamClaudeMessageAsync(request, cancellationToken))
+        await foreach (var response in _client.Messages.StreamClaudeMessageAsync(request, ct))
         {
             if (response.Delta?.Text is not null)
             {
-                yield return new StreamingChatMessageContent(
-                    AuthorRole.Assistant,
-                    response.Delta.Text)
-                {
-                    ModelId = modelId
-                };
+                yield return new StreamingChatMessageContent(AuthorRole.Assistant, response.Delta.Text) { ModelId = modelId };
             }
         }
     }
-
-    private const int MaxToolResultLength = 4000;
-    private const int MaxToolCallRounds = 50;
 
     private async Task<IReadOnlyList<ChatMessageContent>> HandleToolCallsAsync(
         MessageResponse response,
         ChatHistory chatHistory,
         Kernel kernel,
-        PromptExecutionSettings? executionSettings,
-        CancellationToken cancellationToken,
-        int currentRound = 1,
-        List<Message>? accumulatedMessages = null)
+        PromptExecutionSettings? settings,
+        CancellationToken ct,
+        int round = 1,
+        List<Message>? accumulated = null)
     {
-        logger?.LogInformation("Tool call round {Round}/{Max}", currentRound, MaxToolCallRounds);
+        if (round > 50) throw new InvalidOperationException("Max tool rounds reached");
 
-        var toolResultContents = new List<ContentBase>();
+        var toolResults = new List<ContentBase>();
         var assistantContent = new List<ContentBase>();
-
-        var toolCallsInRound = 0;
 
         foreach (var block in response.Content)
         {
             if (block is ToolUseContent toolUse)
             {
                 assistantContent.Add(toolUse);
-                toolCallsInRound++;
-
-                var inputJson = toolUse.Input?.ToString() ?? "{}";
-                var truncatedInput = inputJson.Length > 200 ? inputJson[..200] + "..." : inputJson;
-                logger?.LogInformation("Tool call [{Round}.{Index}]: {ToolName} with input: {Input}",
-                    currentRound, toolCallsInRound, toolUse.Name, truncatedInput);
-
-                var result = await InvokeKernelFunctionAsync(kernel, toolUse, cancellationToken);
-
-                var truncatedResult = result.Length > 300 ? result[..300] + "..." : result;
-                logger?.LogInformation("Tool result [{Round}.{Index}]: {ToolName} returned {Length} chars: {Result}",
-                    currentRound, toolCallsInRound, toolUse.Name, result.Length, truncatedResult);
-
-                if (result.Length > MaxToolResultLength)
-                {
-                    result = result[..MaxToolResultLength] + "\n... (truncated)";
-                }
-
-                toolResultContents.Add(new ToolResultContent
-                {
-                    ToolUseId = toolUse.Id,
-                    Content = [new AnthropicTextContent { Text = result }]
-                });
+                var result = await InvokeFunctionAsync(kernel, toolUse, ct);
+                if (result.Length > 4000) result = result[..4000] + "... (truncated)";
+                
+                toolResults.Add(new ToolResultContent { ToolUseId = toolUse.Id, Content = [new AnthropicTextContent { Text = result }] });
             }
-            else if (block is AnthropicTextContent textContent)
-            {
-                assistantContent.Add(textContent);
-            }
+            else if (block is AnthropicTextContent text) assistantContent.Add(text);
         }
 
-        logger?.LogInformation("Round {Round} completed: {ToolCount} tool(s) called", currentRound, toolCallsInRound);
+        var newMessages = accumulated ?? ConvertMessages(chatHistory);
+        newMessages.Add(new Message { Role = RoleType.Assistant, Content = assistantContent });
+        newMessages.Add(new Message { Role = RoleType.User, Content = toolResults });
 
-        var newMessages = accumulatedMessages ?? ConvertToAnthropicMessages(chatHistory);
-
-        newMessages.Add(new Message
-        {
-            Role = RoleType.Assistant,
-            Content = assistantContent
-        });
-
-        newMessages.Add(new Message
-        {
-            Role = RoleType.User,
-            Content = toolResultContents
-        });
-
-        var followUpRequest = new MessageParameters
+        var followUpReq = new MessageParameters
         {
             Model = modelId,
-            MaxTokens = GetMaxTokens(executionSettings),
+            MaxTokens = GetMaxTokens(settings),
             Messages = newMessages,
-            Temperature = GetTemperature(executionSettings),
-            Tools = ConvertKernelFunctionsToTools(kernel),
+            Temperature = GetTemperature(settings),
+            Tools = ConvertTools(kernel),
             ToolChoice = new ToolChoice { Type = ToolChoiceType.Auto }
         };
 
-        var systemPrompt = ExtractSystemPrompt(chatHistory);
-        if (!string.IsNullOrEmpty(systemPrompt))
-        {
-            followUpRequest.System = [new SystemMessage(systemPrompt)];
-        }
+        var system = ExtractSystemPrompt(chatHistory);
+        if (!string.IsNullOrEmpty(system)) followUpReq.System = [new SystemMessage(system)];
 
-        var followUpResponse = await _client.Messages.GetClaudeMessageAsync(followUpRequest, cancellationToken);
+        var followUpResp = await _client.Messages.GetClaudeMessageAsync(followUpReq, ct);
 
-        if (followUpResponse.StopReason == "tool_use")
-        {
-            if (currentRound >= MaxToolCallRounds)
-            {
-                logger?.LogWarning("Max tool call rounds ({Max}) reached, forcing completion", MaxToolCallRounds);
-                followUpRequest.Tools = null;
-                followUpRequest.ToolChoice = null;
-                followUpResponse = await _client.Messages.GetClaudeMessageAsync(followUpRequest, cancellationToken);
-            }
-            else
-            {
-                return await HandleToolCallsAsync(followUpResponse, chatHistory, kernel, executionSettings,
-                    cancellationToken, currentRound + 1, newMessages);
-            }
-        }
+        if (followUpResp.StopReason == "tool_use")
+            return await HandleToolCallsAsync(followUpResp, chatHistory, kernel, settings, ct, round + 1, newMessages);
 
-        return
-        [
-            new ChatMessageContent(AuthorRole.Assistant, ExtractTextContent(followUpResponse))
-            {
-                ModelId = modelId
-            }
-        ];
+        return [CreateMessageContent(followUpResp)];
     }
 
-    private async Task<string> InvokeKernelFunctionAsync(
-        Kernel kernel,
-        ToolUseContent toolUse,
-        CancellationToken cancellationToken)
+    private async Task<string> InvokeFunctionAsync(Kernel kernel, ToolUseContent toolUse, CancellationToken ct)
     {
         try
         {
-            var parts = toolUse.Name.Split(['_', '-'], 2);
-            var (pluginName, functionName) = parts.Length > 1
-                ? (parts[0], parts[1])
-                : ("", toolUse.Name);
-
             KernelFunction? function = null;
-
-            if (!string.IsNullOrEmpty(pluginName) && kernel.Plugins.TryGetPlugin(pluginName, out var plugin))
+            foreach (var p in kernel.Plugins)
             {
-                plugin.TryGetFunction(functionName, out function);
+                if (p.TryGetFunction(toolUse.Name, out function)) break;
+                
+                var parts = toolUse.Name.Split('_', 2);
+                if (parts.Length > 1 && p.Name == parts[0] && p.TryGetFunction(parts[1], out function)) break;
             }
 
-            if (function is null)
+            if (function is null) return JsonSerializer.Serialize(new { error = $"Function {toolUse.Name} not found" });
+
+            var args = new KernelArguments();
+            if (toolUse.Input is JsonNode node)
             {
-                foreach (var p in kernel.Plugins)
+                foreach (var kvp in node.AsObject())
                 {
-                    if (p.TryGetFunction(toolUse.Name, out function) ||
-                        p.TryGetFunction(functionName, out function))
-                    {
-                        break;
-                    }
+                    args[kvp.Key] = kvp.Value?.ToString();
                 }
             }
 
-            if (function is null)
-            {
-                logger?.LogWarning("Function not found: {FunctionName}", toolUse.Name);
-                return JsonSerializer.Serialize(new { error = $"Function '{toolUse.Name}' not found" });
-            }
-
-            var arguments = new KernelArguments();
-            if (toolUse.Input is JsonNode jsonInput)
-            {
-                foreach (var prop in jsonInput.AsObject())
-                {
-                    arguments[prop.Key] = prop.Value?.ToString();
-                }
-            }
-
-            var result = await function.InvokeAsync(kernel, arguments, cancellationToken);
-            return result.ToString() ?? "null";
+            var res = await function.InvokeAsync(kernel, args, ct);
+            return res.ToString() ?? "null";
         }
         catch (Exception ex)
         {
-            logger?.LogError(ex, "Error invoking function {FunctionName}", toolUse.Name);
             return JsonSerializer.Serialize(new { error = ex.Message });
         }
     }
 
-    private static List<Anthropic.SDK.Common.Tool>? ConvertKernelFunctionsToTools(Kernel kernel)
+    private static ChatMessageContent CreateMessageContent(MessageResponse response)
     {
-        var tools = new List<Anthropic.SDK.Common.Tool>();
-
-        foreach (var plugin in kernel.Plugins)
+        var text = string.Join("", response.Content.OfType<AnthropicTextContent>().Select(c => c.Text));
+        return new ChatMessageContent(AuthorRole.Assistant, text)
         {
-            foreach (var function in plugin)
-            {
-                var toolName = $"{plugin.Name}_{function.Name}";
-                var description = function.Description ?? $"Function {function.Name} from plugin {plugin.Name}";
-
-                var properties = new JsonObject();
-                var required = new JsonArray();
-
-                foreach (var param in function.Metadata.Parameters)
-                {
-                    var paramSchema = new JsonObject
-                    {
-                        ["type"] = GetJsonType(param.ParameterType),
-                        ["description"] = param.Description ?? param.Name
-                    };
-
-                    properties[param.Name] = paramSchema;
-
-                    if (param.IsRequired)
-                    {
-                        required.Add(param.Name);
-                    }
-                }
-
-                var inputSchema = new JsonObject
-                {
-                    ["type"] = "object",
-                    ["properties"] = properties
-                };
-
-                if (required.Count > 0)
-                {
-                    inputSchema["required"] = required;
-                }
-
-                var tool = new Function(toolName, description, inputSchema);
-                tools.Add(tool);
-            }
-        }
-
-        return tools.Count > 0 ? tools : null;
-    }
-
-    private static string GetJsonType(Type? type)
-    {
-        if (type is null) return "string";
-
-        return Type.GetTypeCode(type) switch
-        {
-            TypeCode.Boolean => "boolean",
-            TypeCode.Byte or TypeCode.SByte or TypeCode.Int16 or TypeCode.UInt16
-                or TypeCode.Int32 or TypeCode.UInt32 or TypeCode.Int64 or TypeCode.UInt64 => "integer",
-            TypeCode.Single or TypeCode.Double or TypeCode.Decimal => "number",
-            _ => "string"
+            ModelId = response.Model,
+            Metadata = new Dictionary<string, object?> { ["StopReason"] = response.StopReason }
         };
     }
 
-    private static List<Message> ConvertToAnthropicMessages(ChatHistory chatHistory)
+    private static List<Message> ConvertMessages(ChatHistory history) =>
+        history.Where(m => m.Role != AuthorRole.System)
+               .Select(m => new Message
+               {
+                   Role = m.Role == AuthorRole.User ? RoleType.User : RoleType.Assistant,
+                   Content = [new AnthropicTextContent { Text = m.Content ?? "" }]
+               }).ToList();
+
+    private static string ExtractSystemPrompt(ChatHistory history) =>
+        string.Join("\n\n", history.Where(m => m.Role == AuthorRole.System).Select(m => m.Content));
+
+    private static List<Anthropic.SDK.Common.Tool> ConvertTools(Kernel kernel)
     {
-        var messages = new List<Message>();
-
-        foreach (var msg in chatHistory)
+        var tools = new List<Anthropic.SDK.Common.Tool>();
+        foreach (var plugin in kernel.Plugins)
+        foreach (var func in plugin)
         {
-            if (msg.Role == AuthorRole.System)
-                continue;
-
-            var role = msg.Role == AuthorRole.User ? RoleType.User : RoleType.Assistant;
-
-            messages.Add(new Message
+            var props = new JsonObject();
+            var required = new JsonArray();
+            foreach (var p in func.Metadata.Parameters)
             {
-                Role = role,
-                Content = [new AnthropicTextContent { Text = msg.Content ?? string.Empty }]
-            });
+                props[p.Name] = new JsonObject { ["type"] = "string", ["description"] = p.Description ?? "" };
+                if (p.IsRequired) required.Add(p.Name);
+            }
+            
+            var schema = new JsonObject { ["type"] = "object", ["properties"] = props };
+            if (required.Count > 0) schema["required"] = required;
+
+            tools.Add(new Function($"{plugin.Name}_{func.Name}", func.Description ?? "", schema));
         }
-
-        return messages;
+        return tools;
     }
 
-    private static string ExtractSystemPrompt(ChatHistory chatHistory)
-    {
-        var systemMessages = chatHistory
-            .Where(m => m.Role == AuthorRole.System)
-            .Select(m => m.Content)
-            .Where(c => !string.IsNullOrEmpty(c));
+    private static int GetMaxTokens(PromptExecutionSettings? s) => 
+        s?.ExtensionData?.TryGetValue("max_tokens", out var v) == true ? Convert.ToInt32(v) : 4096;
 
-        return string.Join("\n\n", systemMessages);
-    }
-
-    private static string ExtractTextContent(MessageResponse response)
-    {
-        return string.Join("", response.Content
-            .OfType<AnthropicTextContent>()
-            .Select(c => c.Text));
-    }
-
-    private static int GetMaxTokens(PromptExecutionSettings? settings)
-    {
-        if (settings?.ExtensionData?.TryGetValue("max_tokens", out var maxTokens) == true)
-        {
-            return Convert.ToInt32(maxTokens);
-        }
-        return 4096;
-    }
-
-    private static decimal GetTemperature(PromptExecutionSettings? settings)
-    {
-        if (settings?.ExtensionData?.TryGetValue("temperature", out var temp) == true)
-        {
-            return Convert.ToDecimal(temp);
-        }
-        return 0.1m;
-    }
+    private static decimal GetTemperature(PromptExecutionSettings? s) => 
+        s?.ExtensionData?.TryGetValue("temperature", out var v) == true ? Convert.ToDecimal(v) : 0.1m;
 }

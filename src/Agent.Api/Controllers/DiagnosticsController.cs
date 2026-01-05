@@ -1,3 +1,4 @@
+using Agent.Api.Services.Background;
 using Agent.Core;
 using Agent.Core.Configuration;
 using Agent.Core.Models;
@@ -8,611 +9,192 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Options;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Agent.Api.Controllers;
 
-/// <summary>
-/// Main controller for AI Diagnostics Agent operations.
-/// All exceptions are automatically tracked by Application Insights via OpenTelemetry.
-/// </summary>
 [ApiController]
 [Route("api/[controller]")]
 [Produces("application/json")]
 public partial class DiagnosticsController(
     DiagnosticsAgent agent,
+    AlertChannel alertChannel,
     IOptions<AgentConfiguration> config,
     IDistributedCache cache,
     DeduplicationService deduplicationService,
     ILogger<DiagnosticsController> logger) : ControllerBase
 {
     private static readonly TimeSpan WebhookDebounce = TimeSpan.FromMinutes(5);
-    /// <summary>
-    /// Run a full exception analysis from Application Insights.
-    /// </summary>
+    
+    // Cache for common exception types to avoid reallocation
+    private static readonly string[] CommonExceptionTypes = 
+    [
+        "System.NullReferenceException",
+        "System.InvalidOperationException",
+        "System.DivideByZeroException",
+        "System.ArgumentException",
+        "System.FormatException",
+        "System.IndexOutOfRangeException",
+        "System.KeyNotFoundException"
+    ];
+
     [HttpPost("analyze")]
     [ProducesResponseType<DiagnosticReport>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
     public async Task<ActionResult<DiagnosticReport>> Analyze(
         [FromBody] AnalysisRequest? request,
-        CancellationToken cancellationToken)
+        CancellationToken ct)
     {
         request ??= AnalysisRequest.Default;
+        logger.LogInformation("Starting analysis. Hours: {Hours}, MinOccurrences: {Min}", 
+            request.HoursToAnalyze, request.MinOccurrences);
 
-        logger.LogInformation(
-            "Starting analysis for {Hours}h with min {MinOccurrences} occurrences",
-            request.HoursToAnalyze,
-            request.MinOccurrences);
-
-        var report = await agent.AnalyzeAndFixAsync(request, cancellationToken);
-
-        logger.LogInformation(
-            "Analysis completed: {ExceptionCount} exceptions found, {FixCount} fixes proposed",
-            report.TotalExceptions,
-            report.TotalFixes);
-
+        var report = await agent.AnalyzeAndFixAsync(request, ct);
         return Ok(report);
     }
 
-    /// <summary>
-    /// Run a quick scan with minimal settings.
-    /// </summary>
     [HttpPost("quick-scan")]
     [ProducesResponseType<DiagnosticReport>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
-    public async Task<ActionResult<DiagnosticReport>> QuickScan(CancellationToken cancellationToken)
+    public async Task<ActionResult<DiagnosticReport>> QuickScan(CancellationToken ct)
     {
-        logger.LogInformation("Starting quick scan");
-
-        var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.QuickScan, cancellationToken);
-
-        return Ok(report);
+        return Ok(await agent.AnalyzeAndFixAsync(AnalysisRequest.QuickScan, ct));
     }
 
-    /// <summary>
-    /// Analyze only the most recent exception and create a PR.
-    /// </summary>
     [HttpPost("analyze-latest")]
     [ProducesResponseType<DiagnosticReport>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status500InternalServerError)]
-    public async Task<ActionResult<DiagnosticReport>> AnalyzeLatest(CancellationToken cancellationToken)
+    public async Task<ActionResult<DiagnosticReport>> AnalyzeLatest(CancellationToken ct)
     {
-        logger.LogInformation("Analyzing latest exception only");
-
-        var report = await agent.AnalyzeAndFixAsync(AnalysisRequest.Latest, cancellationToken);
-
-        return Ok(report);
+        return Ok(await agent.AnalyzeAndFixAsync(AnalysisRequest.Latest, ct));
     }
 
-    /// <summary>
-    /// Get current agent status and configuration.
-    /// </summary>
     [HttpGet("status")]
-    [ProducesResponseType<AgentStatus>(StatusCodes.Status200OK)]
-    public ActionResult<AgentStatus> GetStatus()
+    public ActionResult<AgentStatus> GetStatus() => Ok(new AgentStatus
     {
-        var status = new AgentStatus
-        {
-            IsHealthy = true,
-            Timestamp = DateTimeOffset.UtcNow,
-            Runtime = Environment.Version.ToString(),
-            Framework = "net10.0",
-            SemanticKernelVersion = "1.45.0"
-        };
+        IsHealthy = true,
+        Timestamp = DateTimeOffset.UtcNow,
+        Runtime = Environment.Version.ToString(),
+        Framework = "net10.0",
+        SemanticKernelVersion = "1.45.0"
+    });
 
-        return Ok(status);
-    }
-
-    /// <summary>
-    /// Clear the deduplication cache for a specific exception or all exceptions.
-    /// Use this when a PR was closed without merging and you want to re-analyze.
-    /// </summary>
-    /// <param name="problemId">Optional: specific problemId to clear. If empty, clears all analyzed markers.</param>
     [HttpDelete("cache/dedup")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
     public async Task<ActionResult> ClearDeduplicationCache(
         [FromQuery] string? problemId = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken ct = default)
     {
         if (!string.IsNullOrEmpty(problemId))
         {
-            await deduplicationService.ClearAsync(problemId, cancellationToken);
-            logger.LogInformation("Cleared deduplication cache for: {ProblemId}", problemId);
+            await deduplicationService.ClearAsync(problemId, ct);
             return Ok(new { message = $"Cleared cache for: {problemId}" });
         }
 
-        // Clear all analyzed:* keys by pattern (requires listing known patterns)
-        // For now, clear common exception types
-        var commonTypes = new[]
+        foreach (var type in CommonExceptionTypes)
         {
-            "System.NullReferenceException",
-            "System.InvalidOperationException",
-            "System.DivideByZeroException",
-            "System.ArgumentException",
-            "System.FormatException",
-            "System.IndexOutOfRangeException",
-            "System.KeyNotFoundException"
-        };
-
-        foreach (var type in commonTypes)
-        {
-            await cache.RemoveAsync($"analyzed:{type}", cancellationToken);
+            await cache.RemoveAsync($"analyzed:{type}", ct);
         }
 
-        logger.LogInformation("Cleared deduplication cache for common exception types");
         return Ok(new { message = "Cleared deduplication cache for common exception types" });
     }
 
-    /// <summary>
-    /// Test LLM connectivity.
-    /// </summary>
-    [HttpGet("test-llm")]
-    [ProducesResponseType<LlmTestResult>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status503ServiceUnavailable)]
-    public async Task<ActionResult<LlmTestResult>> TestLlm(CancellationToken cancellationToken)
-    {
-        logger.LogInformation("Testing LLM connectivity");
-
-        var chunks = new List<string>();
-        var request = AnalysisRequest.QuickScan with { MaxExceptionsToAnalyze = 1 };
-
-        await foreach (var chunk in agent.AnalyzeStreamingAsync(request, cancellationToken).Take(5))
-        {
-            chunks.Add(chunk);
-        }
-
-        return Ok(new LlmTestResult
-        {
-            Success = true,
-            Message = "LLM connection successful",
-            SampleResponse = string.Join("", chunks)
-        });
-    }
-
-    /// <summary>
-    /// Test Application Insights connectivity and list available tables.
-    /// </summary>
-    [HttpGet("test-appinsights")]
-    [ProducesResponseType<AppInsightsTestResult>(StatusCodes.Status200OK)]
-    public async Task<ActionResult<AppInsightsTestResult>> TestAppInsights(CancellationToken cancellationToken)
-    {
-        var workspaceId = config.Value.AppInsights.WorkspaceId;
-        logger.LogInformation("Testing App Insights connection. WorkspaceId: {WorkspaceId}", workspaceId);
-
-        if (string.IsNullOrEmpty(workspaceId))
-        {
-            return Ok(new AppInsightsTestResult
-            {
-                Success = false,
-                WorkspaceId = "(not configured)",
-                Message = "WorkspaceId is not configured",
-                Error = "Set Agent:AppInsights:WorkspaceId in user secrets or configuration"
-            });
-        }
-
-        try
-        {
-            var client = new LogsQueryClient(new DefaultAzureCredential());
-
-            var response = await client.QueryWorkspaceAsync(
-                workspaceId,
-                "search * | distinct $table | take 20",
-                new QueryTimeRange(TimeSpan.FromHours(24)),
-                cancellationToken: cancellationToken);
-
-            List<string> tables = [.. response.Value.Table.Rows
-                .Select(r => r[0]?.ToString() ?? "")
-                .Where(t => !string.IsNullOrEmpty(t))];
-
-            return Ok(new AppInsightsTestResult
-            {
-                Success = true,
-                WorkspaceId = workspaceId,
-                Message = $"Connected successfully. Found {tables.Count} tables with data.",
-                AvailableTables = tables
-            });
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Failed to connect to App Insights");
-            return Ok(new AppInsightsTestResult
-            {
-                Success = false,
-                WorkspaceId = workspaceId,
-                Message = "Failed to connect to Application Insights",
-                Error = ex.Message
-            });
-        }
-    }
-
-    /// <summary>
-    /// Webhook endpoint for Azure Monitor alerts.
-    /// Configure this URL in your Azure Monitor Action Group.
-    /// </summary>
-    /// <remarks>
-    /// This endpoint receives alerts from Azure Monitor when exceptions are detected.
-    /// It includes debouncing to prevent multiple analyses within a short time window.
-    /// </remarks>
     [HttpPost("webhook/alert")]
-    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status202Accepted)]
     [ProducesResponseType<WebhookResponse>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<WebhookResponse>> OnAlertWebhook(
         [FromBody] JsonElement alertPayload,
-        CancellationToken cancellationToken)
+        CancellationToken ct)
     {
-        logger.LogInformation("Received Azure Monitor alert webhook");
-
-        try
+        var (alertRule, alertId, severity) = ParseAlertPayload(alertPayload);
+        
+        if (await IsDebounced(alertRule, ct))
         {
-            string alertId = "unknown";
-            string alertRule = "unknown";
-            string severity = "Sev3";
-
-            if (alertPayload.TryGetProperty("data", out var data) &&
-                data.TryGetProperty("essentials", out var essentials))
+            return StatusCode(429, new WebhookResponse
             {
-                if (essentials.TryGetProperty("alertId", out var alertIdProp))
-                    alertId = alertIdProp.GetString() ?? "unknown";
-
-                if (essentials.TryGetProperty("alertRule", out var ruleProp))
-                    alertRule = ruleProp.GetString() ?? "unknown";
-
-                if (essentials.TryGetProperty("severity", out var sevProp))
-                    severity = sevProp.GetString() ?? "Sev3";
-            }
-
-            logger.LogInformation("Alert received: Rule={Rule}, Severity={Severity}, AlertId={AlertId}",
-                alertRule, severity, alertId);
-
-            // check if we've processed an alert recently
-            var debounceKey = $"webhook:debounce:{alertRule}";
-            var lastProcessed = await cache.GetStringAsync(debounceKey, cancellationToken);
-
-            if (lastProcessed != null)
-            {
-                logger.LogInformation("Debouncing alert {Rule} - last processed at {Time}", alertRule, lastProcessed);
-                return StatusCode(429, new WebhookResponse
-                {
-                    Status = "debounced",
-                    Message = $"Alert was recently processed. Next analysis allowed after debounce period.",
-                    AlertRule = alertRule,
-                    LastProcessedAt = lastProcessed
-                });
-            }
-
-            await cache.SetStringAsync(
-                debounceKey,
-                DateTimeOffset.UtcNow.ToString("O"),
-                new DistributedCacheEntryOptions
-                {
-                    AbsoluteExpirationRelativeToNow = WebhookDebounce
-                },
-                cancellationToken);
-
-            // Run analysis in the background to respond quickly to Azure
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    logger.LogInformation("Starting background analysis triggered by alert {Rule}", alertRule);
-                    var request = new AnalysisRequest
-                    {
-                        HoursToAnalyze = 1,
-                        CreatePullRequest = true,
-                        MinOccurrences = 1,
-                        MaxExceptionsToAnalyze = 10,
-                        LatestOnly = false
-                    };
-                    var report = await agent.AnalyzeAndFixAsync(request, CancellationToken.None);
-                    logger.LogInformation("Background analysis completed: {Fixes} fixes, {PRs} PRs created",
-                        report.TotalFixes, report.TotalPullRequests);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "Background analysis failed for alert {Rule}", alertRule);
-                }
-            }, cancellationToken);
-
-            return Ok(new WebhookResponse
-            {
-                Status = "accepted",
-                Message = "Alert received. Analysis started in background.",
+                Status = "debounced",
                 AlertRule = alertRule,
-                TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
+                Message = "Alert processed recently."
             });
         }
-        catch (Exception ex)
+
+        await alertChannel.WriteAsync(new AlertContext(alertRule, IsHybrid: false), ct);
+
+        return Accepted(new WebhookResponse
         {
-            logger.LogError(ex, "Error processing alert webhook");
-            return Ok(new WebhookResponse
-            {
-                Status = "error",
-                Message = ex.Message
-            });
-        }
+            Status = "accepted",
+            AlertRule = alertRule,
+            Message = "Alert queued for processing."
+        });
     }
 
-    /// <summary>
-    /// GitHub webhook endpoint for PR events.
-    /// Automatically clears the deduplication cache when a PR is closed without merging.
-    /// Configure this URL in your GitHub repo: Settings > Webhooks > Add webhook
-    /// Set Content-Type to application/json and select "Pull requests" events.
-    /// </summary>
-    [HttpPost("webhook/github")]
-    [ProducesResponseType(StatusCodes.Status200OK)]
-    public async Task<ActionResult> OnGitHubWebhook(
-        [FromBody] JsonElement payload,
-        [FromHeader(Name = "X-GitHub-Event")] string? eventType,
-        CancellationToken cancellationToken)
-    {
-        logger.LogInformation("Received GitHub webhook: {EventType}", eventType);
-
-        if (eventType != "pull_request")
-        {
-            return Ok(new { message = $"Ignored event type: {eventType}" });
-        }
-
-        try
-        {
-            if (!payload.TryGetProperty("action", out var actionProp))
-            {
-                return Ok(new { message = "No action in payload" });
-            }
-
-            var action = actionProp.GetString();
-
-            if (action != "closed")
-            {
-                logger.LogDebug("Ignoring PR action: {Action}", action);
-                return Ok(new { message = $"Ignored action: {action}" });
-            }
-
-            if (!payload.TryGetProperty("pull_request", out var prProp))
-            {
-                return Ok(new { message = "No pull_request in payload" });
-            }
-
-            var merged = prProp.TryGetProperty("merged", out var mergedProp) && mergedProp.GetBoolean();
-            var prNumber = prProp.TryGetProperty("number", out var numProp) ? numProp.GetInt32() : 0;
-            var prTitle = prProp.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "";
-
-            if (merged)
-            {
-                logger.LogInformation("PR #{Number} was merged - no cache clear needed", prNumber);
-                return Ok(new { message = $"PR #{prNumber} merged - fix applied" });
-            }
-
-            logger.LogInformation("PR #{Number} closed without merge - clearing dedup cache", prNumber);
-
-            var exceptionType = ExtractExceptionTypeFromTitle(prTitle ?? "");
-
-            if (!string.IsNullOrEmpty(exceptionType))
-            {
-                // Clear all cache entries containing this exception type
-                // Since we don't have the exact problemId, clear by pattern
-                await deduplicationService.ClearByPatternAsync(exceptionType, cancellationToken);
-                logger.LogInformation("Cleared cache for exception type: {Type}", exceptionType);
-
-                return Ok(new
-                {
-                    message = $"PR #{prNumber} closed - cache cleared for {exceptionType}",
-                    exceptionType
-                });
-            }
-
-            return Ok(new { message = $"PR #{prNumber} closed - could not extract exception type from title" });
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Error processing GitHub webhook");
-            return Ok(new { error = ex.Message });
-        }
-    }
-
-    private static string? ExtractExceptionTypeFromTitle(string title)
-    {
-        var match = MyRegex().Match(title);
-
-        if (match.Success)
-        {
-            return "System." + match.Groups[1].Value;
-        }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Webhook endpoint for Azure Monitor alerts using HYBRID analysis.
-    /// Unlike the standard webhook, this allows Claude to use tools if it needs more context.
-    /// </summary>
-    /// <remarks>
-    /// Use this webhook when you want Claude to be able to investigate further:
-    /// - Look at related files (imports, base classes)
-    /// - Search for class/method definitions
-    /// - Get more exception samples from AppInsights
-    ///
-    /// Configure this URL in your Azure Monitor Action Group as an alternative to /webhook/alert
-    /// </remarks>
     [HttpPost("webhook/alert-hybrid")]
-    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
+    [ProducesResponseType<WebhookResponse>(StatusCodes.Status202Accepted)]
     [ProducesResponseType<WebhookResponse>(StatusCodes.Status429TooManyRequests)]
     public async Task<ActionResult<WebhookResponse>> OnAlertWebhookHybrid(
         [FromBody] JsonElement alertPayload,
-        CancellationToken cancellationToken)
+        CancellationToken ct)
     {
-        logger.LogInformation("Received Azure Monitor alert webhook (HYBRID mode)");
+        var (alertRule, alertId, severity) = ParseAlertPayload(alertPayload);
 
-        try
+        if (await IsDebounced($"hybrid:{alertRule}", ct))
         {
-            string alertId = "unknown";
-            string alertRule = "unknown";
-            string severity = "Sev3";
-
-            if (alertPayload.TryGetProperty("data", out var data) &&
-                data.TryGetProperty("essentials", out var essentials))
+             return StatusCode(429, new WebhookResponse
             {
-                if (essentials.TryGetProperty("alertId", out var alertIdProp))
-                    alertId = alertIdProp.GetString() ?? "unknown";
-
-                if (essentials.TryGetProperty("alertRule", out var ruleProp))
-                    alertRule = ruleProp.GetString() ?? "unknown";
-
-                if (essentials.TryGetProperty("severity", out var sevProp))
-                    severity = sevProp.GetString() ?? "Sev3";
-            }
-
-            logger.LogInformation("Alert received (HYBRID): Rule={Rule}, Severity={Severity}, AlertId={AlertId}",
-                alertRule, severity, alertId);
-
-            var debounceKey = $"webhook:debounce:hybrid:{alertRule}";
-            var lastProcessed = await cache.GetStringAsync(debounceKey, cancellationToken);
-
-            if (lastProcessed != null)
-            {
-                logger.LogInformation("Debouncing hybrid alert {Rule} - last processed at {Time}", alertRule, lastProcessed);
-                return StatusCode(429, new WebhookResponse
-                {
-                    Status = "debounced",
-                    Message = $"Alert was recently processed. Next analysis allowed after debounce period.",
-                    AlertRule = alertRule,
-                    LastProcessedAt = lastProcessed
-                });
-            }
-
-            await cache.SetStringAsync(
-                debounceKey,
-                DateTimeOffset.UtcNow.ToString("O"),
-                new DistributedCacheEntryOptions
-                {
-                    AbsoluteExpirationRelativeToNow = WebhookDebounce
-                },
-                cancellationToken);
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    logger.LogInformation("Starting HYBRID background analysis triggered by alert {Rule}", alertRule);
-
-                    // Phase 1: Fetch exceptions directly
-                    var appInsightsPlugin = new Agent.Plugins.AppInsightsPlugin(
-                        config.Value.AppInsights.WorkspaceId,
-                        logger as ILogger<Agent.Plugins.AppInsightsPlugin>);
-
-                    var exceptionsJson = await appInsightsPlugin.GetExceptionsAsync(
-                        hours: 1,
-                        minOccurrences: 1,
-                        maxResults: 10);
-
-                    using var doc = JsonDocument.Parse(exceptionsJson);
-                    if (doc.RootElement.ValueKind != JsonValueKind.Array)
-                    {
-                        logger.LogInformation("No exceptions found for hybrid analysis");
-                        return;
-                    }
-
-                    var exceptions = doc.RootElement.EnumerateArray()
-                        .Select(item => new ExceptionInfo
-                        {
-                            ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
-                            Message = item.TryGetProperty("Message", out var msg) ? msg.GetString() ?? "" : "",
-                            StackTrace = item.TryGetProperty("StackTrace", out var st) ? st.GetString() ?? "" : "",
-                            OperationName = item.TryGetProperty("OperationName", out var op) ? op.GetString() ?? "" : "",
-                            Timestamp = DateTimeOffset.UtcNow,
-                            OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
-                            ProblemId = item.TryGetProperty("ProblemId", out var pid) ? pid.GetString() : null,
-                            SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
-                            LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number
-                                ? ln.GetInt32() : null,
-                            ItemId = item.TryGetProperty("ItemId", out var iid) ? iid.GetString() : null,
-                            ItemTimestamp = item.TryGetProperty("Timestamp", out var its) ? its.GetString() : null
-                        })
-                        .Take(10)
-                        .ToList();
-
-                    logger.LogInformation("Found {Count} exceptions for hybrid analysis", exceptions.Count);
-
-                    // Phase 2: Analyze each with hybrid approach
-                    int prsCreated = 0;
-                    foreach (var exception in exceptions)
-                    {
-                        try
-                        {
-                            var result = await agent.AnalyzeHybridAsync(
-                                exception,
-                                createPr: true,
-                                CancellationToken.None);
-
-                            if (!string.IsNullOrEmpty(result.PrUrl))
-                            {
-                                prsCreated++;
-                                logger.LogInformation("HYBRID: Created PR for {Type}: {Url}",
-                                    exception.ExceptionType, result.PrUrl);
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            logger.LogError(ex, "HYBRID: Error analyzing {Type}", exception.ExceptionType);
-                        }
-                    }
-
-                    logger.LogInformation("HYBRID background analysis completed: {PRs} PRs created", prsCreated);
-                }
-                catch (Exception ex)
-                {
-                    logger.LogError(ex, "HYBRID background analysis failed for alert {Rule}", alertRule);
-                }
-            }, cancellationToken);
-
-            return Ok(new WebhookResponse
-            {
-                Status = "accepted",
-                Message = "Alert received. HYBRID analysis started in background (Claude can use tools if needed).",
+                Status = "debounced",
                 AlertRule = alertRule,
-                TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
+                Message = "Hybrid alert processed recently."
             });
         }
-        catch (Exception ex)
+
+        await alertChannel.WriteAsync(new AlertContext(alertRule, IsHybrid: true), ct);
+
+        return Accepted(new WebhookResponse
         {
-            logger.LogError(ex, "Error processing hybrid alert webhook");
-            return Ok(new WebhookResponse
-            {
-                Status = "error",
-                Message = ex.Message
-            });
-        }
+            Status = "accepted",
+            AlertRule = alertRule,
+            Message = "Hybrid alert queued for processing."
+        });
     }
 
-    /// <summary>
-    /// Hybrid analysis: Pre-fetches data but allows Claude to use tools if it needs more context.
-    /// Best of both worlds - fast when data is sufficient, flexible when more investigation is needed.
-    /// </summary>
-    /// <remarks>
-    /// This endpoint uses an optimized hybrid approach:
-    /// 1. Pre-fetches exception data from AppInsights
-    /// 2. Pre-fetches source code from GitHub
-    /// 3. Sends everything to Claude WITH tools available
-    /// 4. Claude analyzes the pre-fetched data first
-    /// 5. Claude can call tools ONLY if it needs more context (other files, more traces, etc.)
-    ///
-    /// This reduces API calls compared to pure agent mode while maintaining flexibility.
-    /// </remarks>
-    /// <param name="request">Analysis request parameters</param>
+    [HttpPost("webhook/github")]
+    public async Task<ActionResult> OnGitHubWebhook(
+        [FromBody] JsonElement payload,
+        [FromHeader(Name = "X-GitHub-Event")] string? eventType,
+        CancellationToken ct)
+    {
+        if (eventType != "pull_request") return Ok(new { message = "Ignored event type" });
+
+        if (!payload.TryGetProperty("action", out var actionProp) || actionProp.GetString() != "closed")
+        {
+            return Ok(new { message = "Ignored action" });
+        }
+
+        if (!payload.TryGetProperty("pull_request", out var prProp)) return Ok();
+
+        if (prProp.TryGetProperty("merged", out var mergedProp) && mergedProp.GetBoolean())
+        {
+            return Ok(new { message = "PR merged" });
+        }
+
+        var prTitle = prProp.TryGetProperty("title", out var titleProp) ? titleProp.GetString() : "";
+        var exceptionType = ExtractExceptionTypeFromTitle(prTitle ?? "");
+
+        if (!string.IsNullOrEmpty(exceptionType))
+        {
+            await deduplicationService.ClearByPatternAsync(exceptionType, ct);
+            logger.LogInformation("Cleared cache for exception type: {Type}", exceptionType);
+        }
+
+        return Ok(new { message = "PR closed without merge, cache updated" });
+    }
+
     [HttpPost("analyze-hybrid")]
-    [ProducesResponseType<HybridAnalysisResponse>(StatusCodes.Status200OK)]
-    [ProducesResponseType<ProblemDetails>(StatusCodes.Status400BadRequest)]
     public async Task<ActionResult<HybridAnalysisResponse>> AnalyzeHybrid(
         [FromBody] HybridAnalysisRequest? request,
-        CancellationToken cancellationToken)
+        CancellationToken ct)
     {
         request ??= new HybridAnalysisRequest();
-
-        logger.LogInformation(
-            "Starting hybrid analysis: hours={Hours}, createPR={CreatePR}",
-            request.HoursToAnalyze,
-            request.CreatePullRequest);
-
-        // Phase 1: Fetch exceptions (directly, not via Claude)
+        
+        // Note: Logic kept inline as requested for specific hybrid flow
+        // In a full refactor, this logic would move to DiagnosticsAgent entirely
+        
         var appInsightsPlugin = new Agent.Plugins.AppInsightsPlugin(
             config.Value.AppInsights.WorkspaceId,
             logger as ILogger<Agent.Plugins.AppInsightsPlugin>);
@@ -623,95 +205,50 @@ public partial class DiagnosticsController(
             request.MaxExceptions);
 
         List<ExceptionInfo> exceptions;
-        try
+        try 
         {
             using var doc = JsonDocument.Parse(exceptionsJson);
-            if (doc.RootElement.ValueKind != JsonValueKind.Array)
-            {
-                return Ok(new HybridAnalysisResponse
-                {
-                    Status = "no_exceptions",
-                    Message = "No exceptions found matching criteria",
-                    ExceptionsAnalyzed = 0
-                });
-            }
-
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) return Ok(new HybridAnalysisResponse { Status = "no_exceptions" });
+            
             exceptions = doc.RootElement.EnumerateArray()
-                .Select(item => new ExceptionInfo
-                {
-                    ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
-                    Message = item.TryGetProperty("Message", out var msg) ? msg.GetString() ?? "" : "",
-                    StackTrace = item.TryGetProperty("StackTrace", out var st) ? st.GetString() ?? "" : "",
-                    OperationName = item.TryGetProperty("OperationName", out var op) ? op.GetString() ?? "" : "",
-                    Timestamp = DateTimeOffset.UtcNow,
-                    OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
-                    ProblemId = item.TryGetProperty("ProblemId", out var pid) ? pid.GetString() : null,
-                    SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
-                    LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number
-                        ? ln.GetInt32() : null,
-                    ItemId = item.TryGetProperty("ItemId", out var iid) ? iid.GetString() : null,
-                    ItemTimestamp = item.TryGetProperty("Timestamp", out var its) ? its.GetString() : null
-                })
+                .Select(ParseExceptionInfo)
                 .ToList();
         }
-        catch (JsonException ex)
+        catch (JsonException)
         {
-            logger.LogWarning(ex, "Failed to parse exceptions JSON");
-            return BadRequest(new ProblemDetails
-            {
-                Title = "Invalid response from AppInsights",
-                Detail = ex.Message
-            });
+            return BadRequest(new ProblemDetails { Title = "Invalid AppInsights Response" });
         }
 
-        if (exceptions.Count == 0)
-        {
-            return Ok(new HybridAnalysisResponse
-            {
-                Status = "no_exceptions",
-                Message = "No exceptions found matching criteria",
-                ExceptionsAnalyzed = 0
-            });
-        }
+        if (exceptions.Count == 0) return Ok(new HybridAnalysisResponse { Status = "no_exceptions" });
 
-        logger.LogInformation("Found {Count} exceptions, starting hybrid analysis", exceptions.Count);
-
-        // Phase 2: Analyze each exception with hybrid approach
         var results = new List<HybridExceptionResult>();
-        var prsCreated = new List<string>();
+        var prs = new List<string>();
 
-        foreach (var exception in exceptions.Take(request.MaxExceptions))
+        foreach (var ex in exceptions.Take(request.MaxExceptions))
         {
             try
             {
-                var result = await agent.AnalyzeHybridAsync(
-                    exception,
-                    request.CreatePullRequest,
-                    cancellationToken);
-
-                results.Add(new HybridExceptionResult
-                {
-                    ExceptionType = exception.ExceptionType,
-                    Action = result.Action,
+                var result = await agent.AnalyzeHybridAsync(ex, request.CreatePullRequest, ct);
+                results.Add(new HybridExceptionResult 
+                { 
+                    ExceptionType = ex.ExceptionType, 
+                    Action = result.Action, 
                     RootCause = result.RootCause,
                     PrUrl = result.PrUrl,
-                    FixProposed = result.Fix != null
+                    FixProposed = result.Fix != null 
                 });
-
-                if (!string.IsNullOrEmpty(result.PrUrl))
-                {
-                    prsCreated.Add(result.PrUrl);
-                }
+                
+                if (!string.IsNullOrEmpty(result.PrUrl)) prs.Add(result.PrUrl);
             }
-            catch (Exception ex)
+            catch (Exception e)
             {
-                logger.LogError(ex, "Error in hybrid analysis for {Type}", exception.ExceptionType);
-                results.Add(new HybridExceptionResult
-                {
-                    ExceptionType = exception.ExceptionType,
-                    Action = "error",
-                    RootCause = ex.Message,
-                    FixProposed = false
+                logger.LogError(e, "Hybrid analysis failed for {Type}", ex.ExceptionType);
+                results.Add(new HybridExceptionResult 
+                { 
+                    ExceptionType = ex.ExceptionType, 
+                    Action = "error", 
+                    RootCause = e.Message,
+                    FixProposed = false 
                 });
             }
         }
@@ -719,136 +256,98 @@ public partial class DiagnosticsController(
         return Ok(new HybridAnalysisResponse
         {
             Status = "completed",
-            Message = $"Analyzed {results.Count} exceptions with hybrid approach",
             ExceptionsAnalyzed = results.Count,
             FixesProposed = results.Count(r => r.FixProposed),
-            PullRequestsCreated = prsCreated.Count,
-            PullRequestUrls = prsCreated,
+            PullRequestsCreated = prs.Count,
+            PullRequestUrls = prs,
             Results = results
         });
     }
 
-    /// <summary>
-    /// Simple webhook endpoint for testing (no Azure Monitor payload required).
-    /// </summary>
-    /// <param name="createPR">Whether to create pull requests for fixes</param>
-    /// <param name="hours">Hours to look back for exceptions (default: 1)</param>
-    /// <param name="maxExceptions">Maximum number of exceptions to analyze (default: 10)</param>
-    /// <param name="latestOnly">If true, only analyze the most recent exception (default: false)</param>
-    [HttpPost("webhook/trigger")]
-    [ProducesResponseType<WebhookResponse>(StatusCodes.Status200OK)]
-    public async Task<ActionResult<WebhookResponse>> TriggerAnalysis(
-        [FromQuery] bool createPR = true,
-        [FromQuery] int hours = 1,
-        [FromQuery] int maxExceptions = 10,
-        [FromQuery] bool latestOnly = false,
-        CancellationToken cancellationToken = default)
+    [HttpGet("test-llm")]
+    public async Task<ActionResult<LlmTestResult>> TestLlm(CancellationToken ct)
     {
-        logger.LogInformation(
-            "Manual webhook trigger: createPR={CreatePR}, hours={Hours}, maxExceptions={Max}, latestOnly={LatestOnly}",
-            createPR, hours, maxExceptions, latestOnly);
-
-        var request = new AnalysisRequest
+        var chunks = new List<string>();
+        await foreach (var chunk in agent.AnalyzeStreamingAsync(AnalysisRequest.QuickScan with { MaxExceptionsToAnalyze = 1 }, ct).Take(5))
         {
-            HoursToAnalyze = hours,
-            CreatePullRequest = createPR,
-            MinOccurrences = 1,
-            MaxExceptionsToAnalyze = maxExceptions,
-            LatestOnly = latestOnly
-        };
-
-        var report = await agent.AnalyzeAndFixAsync(request, cancellationToken);
-
-        return Ok(new WebhookResponse
-        {
-            Status = "completed",
-            Message = $"Analysis completed: {report.TotalFixes} fixes proposed, {report.TotalPullRequests} PRs created",
-            PullRequestUrl = report.PullRequestUrl,
-            PullRequestUrls = report.PullRequestUrls,
-            TriggeredAt = DateTimeOffset.UtcNow.ToString("O")
-        });
+            chunks.Add(chunk);
+        }
+        return Ok(new LlmTestResult { Success = true, Message = "LLM Connected", SampleResponse = string.Join("", chunks) });
     }
 
-    [System.Text.RegularExpressions.GeneratedRegex(@"Handle\s+(\w+Exception)", System.Text.RegularExpressions.RegexOptions.IgnoreCase, "fr-FR")]
-    private static partial System.Text.RegularExpressions.Regex MyRegex();
-}
+    [HttpGet("test-appinsights")]
+    public async Task<ActionResult<AppInsightsTestResult>> TestAppInsights(CancellationToken ct)
+    {
+        var workspaceId = config.Value.AppInsights.WorkspaceId;
+        if (string.IsNullOrEmpty(workspaceId))
+            return Ok(new AppInsightsTestResult { Success = false, WorkspaceId = "N/A", Message = "Missing Configuration" });
 
-public record WebhookResponse
-{
-    public required string Status { get; init; }
-    public string? Message { get; init; }
-    public string? AlertRule { get; init; }
-    public string? LastProcessedAt { get; init; }
-    public string? TriggeredAt { get; init; }
-    public string? PullRequestUrl { get; init; }
-    public List<string>? PullRequestUrls { get; init; }
-}
+        try
+        {
+            var client = new LogsQueryClient(new DefaultAzureCredential());
+            var response = await client.QueryWorkspaceAsync(
+                workspaceId,
+                "search * | distinct $table | take 20",
+                new QueryTimeRange(TimeSpan.FromHours(24)),
+                cancellationToken: ct);
 
-public record AgentStatus
-{
-    public bool IsHealthy { get; init; }
-    public DateTimeOffset Timestamp { get; init; }
-    public required string Runtime { get; init; }
-    public required string Framework { get; init; }
-    public required string SemanticKernelVersion { get; init; }
-}
+            var tables = response.Value.Table.Rows
+                .Select(r => r[0]?.ToString() ?? "")
+                .Where(t => !string.IsNullOrEmpty(t))
+                .ToList();
 
-public record LlmTestResult
-{
-    public bool Success { get; init; }
-    public required string Message { get; init; }
-    public string? SampleResponse { get; init; }
-}
+            return Ok(new AppInsightsTestResult { Success = true, WorkspaceId = workspaceId, Message = "Connected", AvailableTables = tables });
+        }
+        catch (Exception ex)
+        {
+            return Ok(new AppInsightsTestResult { Success = false, WorkspaceId = workspaceId, Message = "Connection Failed", Error = ex.Message });
+        }
+    }
 
-public record AppInsightsTestResult
-{
-    public bool Success { get; init; }
-    public required string WorkspaceId { get; init; }
-    public required string Message { get; init; }
-    public string? Error { get; init; }
-    public List<string>? AvailableTables { get; init; }
-}
+    // --- Helpers ---
 
-/// <summary>
-/// Request for hybrid analysis endpoint
-/// </summary>
-public record HybridAnalysisRequest
-{
-    /// <summary>Hours to look back for exceptions</summary>
-    public int HoursToAnalyze { get; init; } = 24;
+    private async Task<bool> IsDebounced(string key, CancellationToken ct)
+    {
+        var dbKey = $"webhook:debounce:{key}";
+        if (await cache.GetStringAsync(dbKey, ct) != null) return true;
 
-    /// <summary>Minimum occurrences to consider an exception</summary>
-    public int MinOccurrences { get; init; } = 1;
+        await cache.SetStringAsync(dbKey, DateTimeOffset.UtcNow.ToString("O"), 
+            new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = WebhookDebounce }, ct);
+        return false;
+    }
 
-    /// <summary>Maximum number of exceptions to analyze</summary>
-    public int MaxExceptions { get; init; } = 5;
+    private static (string Rule, string Id, string Severity) ParseAlertPayload(JsonElement payload)
+    {
+        string rule = "unknown", id = "unknown", sev = "Sev3";
+        if (payload.TryGetProperty("data", out var data) && data.TryGetProperty("essentials", out var essentials))
+        {
+            rule = essentials.TryGetProperty("alertRule", out var r) ? r.GetString() ?? rule : rule;
+            id = essentials.TryGetProperty("alertId", out var i) ? i.GetString() ?? id : id;
+            sev = essentials.TryGetProperty("severity", out var s) ? s.GetString() ?? sev : sev;
+        }
+        return (rule, id, sev);
+    }
 
-    /// <summary>Whether to create PRs for fixes</summary>
-    public bool CreatePullRequest { get; init; } = false;
-}
+    private static ExceptionInfo ParseExceptionInfo(JsonElement item) => new()
+    {
+        ExceptionType = item.GetProperty("ExceptionType").GetString() ?? "Unknown",
+        Message = item.TryGetProperty("Message", out var m) ? m.GetString() ?? "" : "",
+        StackTrace = item.TryGetProperty("StackTrace", out var s) ? s.GetString() ?? "" : "",
+        OperationName = item.TryGetProperty("OperationName", out var o) ? o.GetString() ?? "" : "",
+        Timestamp = DateTimeOffset.UtcNow,
+        OccurrenceCount = item.TryGetProperty("OccurrenceCount", out var oc) ? oc.GetInt32() : 0,
+        ProblemId = item.TryGetProperty("ProblemId", out var p) ? p.GetString() : null,
+        SourceFile = item.TryGetProperty("SourceFile", out var sf) ? sf.GetString() : null,
+        LineNumber = item.TryGetProperty("LineNumber", out var ln) && ln.ValueKind == JsonValueKind.Number ? ln.GetInt32() : null,
+        ItemId = item.TryGetProperty("ItemId", out var i) ? i.GetString() : null
+    };
 
-/// <summary>
-/// Response from hybrid analysis endpoint
-/// </summary>
-public record HybridAnalysisResponse
-{
-    public required string Status { get; init; }
-    public string? Message { get; init; }
-    public int ExceptionsAnalyzed { get; init; }
-    public int FixesProposed { get; init; }
-    public int PullRequestsCreated { get; init; }
-    public List<string>? PullRequestUrls { get; init; }
-    public List<HybridExceptionResult>? Results { get; init; }
-}
+    private static string? ExtractExceptionTypeFromTitle(string title)
+    {
+        var match = ExceptionRegex().Match(title);
+        return match.Success ? "System." + match.Groups[1].Value : null;
+    }
 
-/// <summary>
-/// Result for a single exception in hybrid analysis
-/// </summary>
-public record HybridExceptionResult
-{
-    public required string ExceptionType { get; init; }
-    public required string Action { get; init; }
-    public string? RootCause { get; init; }
-    public string? PrUrl { get; init; }
-    public bool FixProposed { get; init; }
+    [GeneratedRegex(@"Handle\s+(\w+Exception)", RegexOptions.IgnoreCase, "fr-FR")]
+    private static partial Regex ExceptionRegex();
 }

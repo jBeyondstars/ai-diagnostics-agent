@@ -3,50 +3,24 @@ using Microsoft.AspNetCore.Mvc;
 namespace Agent.Api.Controllers;
 
 /// <summary>
-/// Orders controller with 5 intentional bugs for AI diagnostics testing.
-/// Each endpoint contains a real bug that Claude should detect and fix.
+/// Orders controller with intentional bugs for AI diagnostics testing.
 /// </summary>
 [ApiController]
 [Route("api/[controller]")]
 [Produces("application/json")]
 public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
 {
-    // Simulated database
     private static readonly Dictionary<int, OrderEntity> _orders = new()
     {
-        [1001] = new OrderEntity
-        {
-            Id = 1001,
-            CustomerId = 1,
-            Items = [new OrderItem { ProductId = 101, Name = "Laptop", Price = 999.99m, Quantity = 1 }],
-            Status = "Completed",
-            Discount = null
-        },
-        [1002] = new OrderEntity
-        {
-            Id = 1002,
-            CustomerId = 2,
-            Items = [
-                new OrderItem { ProductId = 102, Name = "Mouse", Price = 29.99m, Quantity = 2 },
-                new OrderItem { ProductId = 103, Name = "Keyboard", Price = 79.99m, Quantity = 1 }
-            ],
-            Status = "Pending",
-            Discount = new Discount { Code = "SAVE10", Percentage = 10 }
-        },
-        [1003] = new OrderEntity
-        {
-            Id = 1003,
-            CustomerId = 3,
-            Items = [],  // Empty order - will cause bugs
-            Status = "Draft",
-            Discount = null
-        }
+        [1001] = new OrderEntity { Id = 1001, CustomerId = 1, Items = [new OrderItem { ProductId = 101, Name = "Laptop", Price = 999.99m, Quantity = 1 }], Status = "Completed" },
+        [1002] = new OrderEntity { Id = 1002, CustomerId = 2, Items = [new OrderItem { ProductId = 102, Name = "Mouse", Price = 29.99m, Quantity = 2 }], Status = "Pending", Discount = new Discount { Code = "SAVE10", Percentage = 10 } },
+        [1003] = new OrderEntity { Id = 1003, CustomerId = 3, Items = [], Status = "Draft" } // Empty items -> bugs
     };
 
     private static readonly Dictionary<int, Customer> _customers = new()
     {
         [1] = new Customer { Id = 1, Name = "Alice Smith", Email = "alice@example.com", Address = new Address { City = "Paris", Country = "France" } },
-        [2] = new Customer { Id = 2, Name = "Bob Jones", Email = "bob@example.com", Address = null },  // No address
+        [2] = new Customer { Id = 2, Name = "Bob Jones", Email = "bob@example.com", Address = null }, // Null address -> bug
         [3] = new Customer { Id = 3, Name = "Charlie Brown", Email = "charlie@example.com", Address = new Address { City = "London", Country = "UK" } }
     };
 
@@ -57,105 +31,57 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
         [103] = new Product { Id = 103, Name = "Keyboard", Stock = 0, Category = "Electronics" }
     };
 
-    /// <summary>
-    /// BUG 1: NullReferenceException - Customer address can be null
-    /// Test: GET /api/orders/1002/shipping
-    /// </summary>
     [HttpGet("{orderId:int}/shipping")]
     public ActionResult<ShippingInfo> GetShippingInfo([FromRoute] int orderId)
     {
         logger.LogInformation("Getting shipping info for order {OrderId}", orderId);
-
-        if (!_orders.TryGetValue(orderId, out var order))
-        {
-            return NotFound(new { message = $"Order {orderId} not found" });
-        }
+        if (!_orders.TryGetValue(orderId, out var order)) return NotFound();
 
         var customer = _customers[order.CustomerId];
 
-        // BUG: customer.Address can be null (Customer ID 2 has no address)
-        var shippingCity = customer.Address.City;
-        var shippingCountry = customer.Address.Country;
-
-        logger.LogInformation("Shipping to {City}, {Country}", shippingCity, shippingCountry);
-
-        return Ok(new ShippingInfo
-        {
-            OrderId = orderId,
-            CustomerName = customer.Name,
-            City = shippingCity,
-            Country = shippingCountry,
-            EstimatedDays = shippingCountry == "France" ? 2 : 5
-        });
+        // Demo Bug: customer.Address can be null
+        return Ok(new ShippingInfo(
+            orderId,
+            customer.Name,
+            customer.Address.City,
+            customer.Address.Country,
+            customer.Address.Country == "France" ? 2 : 5
+        ));
     }
 
-    /// <summary>
-    /// BUG 2: InvalidOperationException - Empty collection with .First()
-    /// Test: GET /api/orders/1003/first-item
-    /// </summary>
     [HttpGet("{orderId:int}/first-item")]
     public ActionResult<OrderItemDto> GetFirstItem([FromRoute] int orderId)
     {
         logger.LogInformation("Getting first item for order {OrderId}", orderId);
+        if (!_orders.TryGetValue(orderId, out var order)) return NotFound();
 
-        if (!_orders.TryGetValue(orderId, out var order))
-        {
-            return NotFound(new { message = $"Order {orderId} not found" });
-        }
-
-        // BUG: Order 1003 has empty Items list - .First() will throw InvalidOperationException
+        // Demo Bug: .First() on empty list
         var firstItem = order.Items.First();
 
-        return Ok(new OrderItemDto
-        {
-            ProductId = firstItem.ProductId,
-            Name = firstItem.Name,
-            Price = firstItem.Price,
-            Quantity = firstItem.Quantity
-        });
+        return Ok(new OrderItemDto(firstItem.ProductId, firstItem.Name, firstItem.Price, firstItem.Quantity));
     }
 
-    /// <summary>
-    /// BUG 3: DivideByZeroException - Division when total is zero
-    /// Test: GET /api/orders/1003/discount-rate
-    /// </summary>
     [HttpGet("{orderId:int}/discount-rate")]
     public ActionResult<DiscountResult> CalculateDiscountRate([FromRoute] int orderId)
     {
         logger.LogInformation("Calculating discount rate for order {OrderId}", orderId);
-
-        if (!_orders.TryGetValue(orderId, out var order))
-        {
-            return NotFound(new { message = $"Order {orderId} not found" });
-        }
+        if (!_orders.TryGetValue(orderId, out var order)) return NotFound();
 
         var subtotal = order.Items.Sum(i => i.Price * i.Quantity);
         var discountAmount = order.Discount?.Percentage ?? 0;
 
-        // BUG: subtotal is 0 for order 1003 (empty items) - division by zero
+        // Demo Bug: Divide by zero if subtotal is 0
         var effectiveRate = (discountAmount * 100) / subtotal;
 
-        logger.LogInformation("Discount rate: {Rate}%", effectiveRate);
-
-        return Ok(new DiscountResult
-        {
-            OrderId = orderId,
-            Subtotal = subtotal,
-            DiscountAmount = discountAmount,
-            EffectiveRate = effectiveRate
-        });
+        return Ok(new DiscountResult(orderId, subtotal, discountAmount, effectiveRate));
     }
 
-    /// <summary>
-    /// BUG 4: KeyNotFoundException - Product ID doesn't exist in dictionary
-    /// Test: GET /api/orders/products/999/stock
-    /// </summary>
     [HttpGet("products/{productId:int}/stock")]
     public ActionResult<StockInfo> GetProductStock([FromRoute] int productId)
     {
         logger.LogInformation("Checking stock for product {ProductId}", productId);
-
-        // BUG: No TryGetValue - throws KeyNotFoundException for non-existent products
+        
+        // Demo Bug: Missing TryGetValue check
         var product = _products[productId];
 
         var stockStatus = product.Stock switch
@@ -166,143 +92,75 @@ public class OrdersController(ILogger<OrdersController> logger) : ControllerBase
             _ => "Well Stocked"
         };
 
-        return Ok(new StockInfo
-        {
-            ProductId = productId,
-            ProductName = product.Name,
-            CurrentStock = product.Stock,
-            Status = stockStatus
-        });
+        return Ok(new StockInfo(productId, product.Name, product.Stock, stockStatus));
     }
 
-    /// <summary>
-    /// BUG 5: IndexOutOfRangeException - Accessing array with invalid index
-    /// Test: GET /api/orders/customer/99/average
-    /// </summary>
     [HttpGet("customer/{customerId:int}/average")]
     public ActionResult<CustomerStats> GetCustomerAverageOrderValue([FromRoute] int customerId)
     {
         logger.LogInformation("Calculating average order value for customer {CustomerId}", customerId);
 
-        var customerOrders = _orders.Values
-            .Where(o => o.CustomerId == customerId)
-            .ToList();
+        var customerOrders = _orders.Values.Where(o => o.CustomerId == customerId).ToList();
+        var orderTotals = customerOrders.Select(o => o.Items.Sum(i => i.Price * i.Quantity)).ToArray();
 
-        // BUG: If customer has no orders (e.g., customerId=99), this array is empty
-        var orderTotals = customerOrders
-            .Select(o => o.Items.Sum(i => i.Price * i.Quantity))
-            .ToArray();
-
-        // BUG: Accessing index 0 on empty array throws IndexOutOfRangeException
-        var firstOrderTotal = orderTotals[0];
-        var lastOrderTotal = orderTotals[orderTotals.Length - 1];
-        var averageTotal = orderTotals.Sum() / orderTotals.Length;
-
-        logger.LogInformation("Customer {CustomerId}: First={First}, Last={Last}, Avg={Avg}",
-            customerId, firstOrderTotal, lastOrderTotal, averageTotal);
-
-        return Ok(new CustomerStats
-        {
-            CustomerId = customerId,
-            TotalOrders = customerOrders.Count,
-            FirstOrderValue = firstOrderTotal,
-            LastOrderValue = lastOrderTotal,
-            AverageOrderValue = averageTotal
-        });
+        // Demo Bug: Index 0 access on empty array
+        return Ok(new CustomerStats(
+            customerId,
+            customerOrders.Count,
+            orderTotals[0],
+            orderTotals[^1],
+            orderTotals.Sum() / orderTotals.Length
+        ));
     }
 }
 
-#region Models
-
-public class OrderEntity
+public record OrderEntity
 {
-    public int Id { get; set; }
-    public int CustomerId { get; set; }
-    public List<OrderItem> Items { get; set; } = [];
-    public string Status { get; set; } = "Draft";
-    public Discount? Discount { get; set; }
+    public int Id { get; init; }
+    public int CustomerId { get; init; }
+    public List<OrderItem> Items { get; init; } = [];
+    public string Status { get; init; } = "Draft";
+    public Discount? Discount { get; init; }
 }
 
-public class OrderItem
+public record OrderItem
 {
-    public int ProductId { get; set; }
-    public required string Name { get; set; }
-    public decimal Price { get; set; }
-    public int Quantity { get; set; }
+    public int ProductId { get; init; }
+    public required string Name { get; init; }
+    public decimal Price { get; init; }
+    public int Quantity { get; init; }
 }
 
-public class Customer
+public record Customer
 {
-    public int Id { get; set; }
-    public required string Name { get; set; }
-    public required string Email { get; set; }
-    public Address? Address { get; set; }
+    public int Id { get; init; }
+    public required string Name { get; init; }
+    public required string Email { get; init; }
+    public Address? Address { get; init; }
 }
 
-public class Address
+public record Address
 {
-    public required string City { get; set; }
-    public required string Country { get; set; }
+    public required string City { get; init; }
+    public required string Country { get; init; }
 }
 
-public class Discount
+public record Discount
 {
-    public required string Code { get; set; }
-    public decimal Percentage { get; set; }
+    public required string Code { get; init; }
+    public decimal Percentage { get; init; }
 }
 
-public class Product
+public record Product
 {
-    public int Id { get; set; }
-    public required string Name { get; set; }
-    public int Stock { get; set; }
-    public required string Category { get; set; }
+    public int Id { get; init; }
+    public required string Name { get; init; }
+    public int Stock { get; init; }
+    public required string Category { get; init; }
 }
 
-#endregion
-
-#region DTOs
-
-public class ShippingInfo
-{
-    public int OrderId { get; set; }
-    public required string CustomerName { get; set; }
-    public required string City { get; set; }
-    public required string Country { get; set; }
-    public int EstimatedDays { get; set; }
-}
-
-public class OrderItemDto
-{
-    public int ProductId { get; set; }
-    public required string Name { get; set; }
-    public decimal Price { get; set; }
-    public int Quantity { get; set; }
-}
-
-public class DiscountResult
-{
-    public int OrderId { get; set; }
-    public decimal Subtotal { get; set; }
-    public decimal DiscountAmount { get; set; }
-    public decimal EffectiveRate { get; set; }
-}
-
-public class StockInfo
-{
-    public int ProductId { get; set; }
-    public required string ProductName { get; set; }
-    public int CurrentStock { get; set; }
-    public required string Status { get; set; }
-}
-
-public class CustomerStats
-{
-    public int CustomerId { get; set; }
-    public int TotalOrders { get; set; }
-    public decimal FirstOrderValue { get; set; }
-    public decimal LastOrderValue { get; set; }
-    public decimal AverageOrderValue { get; set; }
-}
-
-#endregion
+public record ShippingInfo(int OrderId, string CustomerName, string City, string Country, int EstimatedDays);
+public record OrderItemDto(int ProductId, string Name, decimal Price, int Quantity);
+public record DiscountResult(int OrderId, decimal Subtotal, decimal DiscountAmount, decimal EffectiveRate);
+public record StockInfo(int ProductId, string ProductName, int CurrentStock, string Status);
+public record CustomerStats(int CustomerId, int TotalOrders, decimal FirstOrderValue, decimal LastOrderValue, decimal AverageOrderValue);
