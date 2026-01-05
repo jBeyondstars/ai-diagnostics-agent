@@ -424,7 +424,7 @@ public sealed class GitHubPlugin(
             var request = new SearchIssuesRequest(searchQuery) { PerPage = 10 };
             var results = await _client.Search.SearchIssues(request);
 
-            var issues = results.Items.Select(i => new
+            List<object> issues = [.. results.Items.Select(i => new
             {
                 number = i.Number,
                 title = i.Title,
@@ -432,8 +432,8 @@ public sealed class GitHubPlugin(
                 isPullRequest = i.PullRequest is not null,
                 url = i.HtmlUrl,
                 createdAt = i.CreatedAt.ToString("yyyy-MM-dd"),
-                labels = (List<string>)[.. i.Labels.Select(l => l.Name)]
-            }).ToList();
+                labels = i.Labels.Select(l => l.Name).ToList()
+            })];
 
             return JsonSerializer.Serialize(new { totalCount = results.TotalCount, issues }, JsonOptions);
         }

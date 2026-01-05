@@ -3,7 +3,7 @@ namespace Agent.Api.Services;
 /// <summary>
 /// Service for checking inventory levels.
 /// </summary>
-public class InventoryService(ILogger<InventoryService> logger)
+public sealed class InventoryService(ILogger<InventoryService> logger)
 {
     // Simulated inventory data
     private static readonly Dictionary<int, InventoryItem> _inventory = new()

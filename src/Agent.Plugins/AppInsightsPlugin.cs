@@ -2,7 +2,6 @@ using Azure.Identity;
 using Azure.Monitor.Query;
 using Microsoft.Extensions.Logging;
 using Microsoft.SemanticKernel;
-using System.Collections.Frozen;
 using System.ComponentModel;
 using System.Text.Json;
 using System.Text.RegularExpressions;

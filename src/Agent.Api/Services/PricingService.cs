@@ -3,7 +3,7 @@ namespace Agent.Api.Services;
 /// <summary>
 /// Service for calculating product prices with discounts.
 /// </summary>
-public class PricingService(ILogger<PricingService> logger)
+public sealed class PricingService(ILogger<PricingService> logger)
 {
     // Discount rules by customer tier
     private static readonly Dictionary<string, decimal> _tierDiscounts = new()

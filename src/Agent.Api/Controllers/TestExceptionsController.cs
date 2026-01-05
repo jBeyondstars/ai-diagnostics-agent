@@ -145,12 +145,12 @@ public class TestExceptionsController(ILogger<TestExceptionsController> logger) 
     {
         logger.LogInformation("Running parallel operations");
 
-        var exceptions = new List<Exception>
-        {
+        List<Exception> exceptions =
+        [
             new InvalidOperationException("Task 1 failed: Database connection lost"),
             new TimeoutException("Task 2 failed: Redis cache timeout"),
             new HttpRequestException("Task 3 failed: External API unreachable")
-        };
+        ];
 
         throw new AggregateException("Multiple parallel operations failed", exceptions);
     }
@@ -269,13 +269,13 @@ public class UsersController(ILogger<UsersController> logger) : ControllerBase
         var firstResult = results[0];
         logger.LogInformation("First match: {Name}", firstResult.Name);
 
-        return Ok((List<UserDto>)[.. results.Select(u => new UserDto
+        return Ok(results.Select(u => new UserDto
         {
             Id = u.Id,
             Name = u.Name,
             Email = u.Email ?? "N/A",
             PrimaryRole = u.Roles.FirstOrDefault() ?? "none"
-        })]);
+        }).ToList());
     }
 }
 

@@ -81,8 +81,9 @@ public class ExceptionHandlingMiddleware(
 
         if (exception is AggregateException aggEx)
         {
-            problemDetails.Extensions["innerExceptions"] = (List<object>)[.. aggEx.InnerExceptions
-                .Select(e => new { type = e.GetType().Name, message = e.Message })];
+            problemDetails.Extensions["innerExceptions"] = aggEx.InnerExceptions
+                .Select(e => new { type = e.GetType().Name, message = e.Message })
+                .ToList();
         }
 
         context.Response.StatusCode = statusCode;
