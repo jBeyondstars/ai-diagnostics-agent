@@ -2,7 +2,7 @@
 
 An AI-powered agent that monitors Application Insights, analyzes exceptions, and automatically creates Pull Requests with fixes.
 
-> **Read the full article on Medium**: [From Exceptions to Pull Requests: Building a Self-Fixing .NET 10 App with AI Agents](https://medium.com/@jbeyondstars/building-a-self---fixing-net-10-app-with-ai-agents-e8605cb11a99)
+> **Read the full article on Medium**: [From Exceptions to Pull Requests: Building a Self-Fixing .NET 10 App with AI Agents](https://medium.com/@schmidt.jeanbaptiste/building-a-self-fixing-net-10-app-with-ai-agents-e8605cb11a99)
 
 ![Architecture Diagram](diagram.png)
 
